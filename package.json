@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
-    "start": "python3 -m http.server 8000"
+    "start": "python3 -m http.server 8000",
+    "build": "node tools/build-single.mjs . accordeur.html"
   }
 }

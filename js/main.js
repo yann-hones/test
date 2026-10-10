@@ -101,9 +101,15 @@ async function startMic() {
   }
   audioCtx = audioCtx || new AudioContext();
   await audioCtx.resume();
-  await audioCtx.audioWorklet.addModule('js/capture-worklet.js');
-  capture = new AudioWorkletNode(audioCtx, 'capture');
-  capture.port.onmessage = (e) => pushSamples(e.data);
+  try {
+    await audioCtx.audioWorklet.addModule('js/capture-worklet.js');
+    capture = new AudioWorkletNode(audioCtx, 'capture');
+    capture.port.onmessage = (e) => pushSamples(e.data);
+  } catch {
+    // page ouverte depuis le disque (file://) ou navigateur ancien : capture par l'ancienne API
+    capture = audioCtx.createScriptProcessor(2048, 1, 1);
+    capture.onaudioprocess = (e) => pushSamples(e.inputBuffer.getChannelData(0));
+  }
   const mute = audioCtx.createGain();
   mute.gain.value = 0; // le nœud doit être relié à la sortie pour être exécuté
   audioCtx.createMediaStreamSource(stream).connect(capture).connect(mute).connect(audioCtx.destination);

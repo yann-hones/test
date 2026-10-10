@@ -68,9 +68,14 @@ export function railsbackCents(key, amount = 1) {
 }
 
 // Écart total (cents) de la cible par rapport au tempérament égal non étiré.
-export function targetOffsetCents(key, { temperament = 'equal', stretch = 1 } = {}) {
+// `curve` (optionnel) : courbe d'étirement propre au piano, indexée par touche, à la place de Railsback.
+export function targetOffsetCents(key, { temperament = 'equal', stretch = 1, curve = null } = {}) {
   const t = TEMPERAMENTS[temperament] || TEMPERAMENTS.equal;
-  return t.offsets[pitchClass(key)] + railsbackCents(key, stretch);
+  return t.offsets[pitchClass(key)] + stretchCents(key, { stretch, curve });
+}
+
+export function stretchCents(key, { stretch = 1, curve = null } = {}) {
+  return curve ? stretch * curve[key] : railsbackCents(key, stretch);
 }
 
 export function equalFreq(key, a4 = 440) {
