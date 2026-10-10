@@ -16,6 +16,8 @@
   </header>
 
   <main>
+    <section id="diag-panel" class="panel diag"></section>
+
     <section class="display" aria-live="polite">
       <div class="note-row">
         <div>
@@ -59,6 +61,15 @@
           plus elles vont vite plus c'est faux. Elles s'arrêtent quand c'est juste.</li>
         <li><b>Les barres « Partiels »</b> : informations pour expert, tu peux les ignorer.</li>
       </ul>
+      <h3>Accorder tout le piano</h3>
+      <ol>
+        <li><b>Diagnostic</b> : joue les 88 notes une à une quand l'appli les demande (environ 5 minutes, sans étouffer les cordes).</li>
+        <li><b>Rapport</b> : l'appli dit si le piano est trop bas ou trop haut, quelles notes sortent du lot,
+          et propose un diapason (440 Hz ou celui du piano) avec une ou deux passes.</li>
+        <li><b>Accord guidé</b> : l'appli enchaîne les notes dans l'ordre des accordeurs (La4, l'octave du milieu, les aigus,
+          puis les graves). Si deux passes sont nécessaires, la première vise un peu au-delà de la note (sur-tension),
+          la seconde règle finement.</li>
+      </ol>
       <h3>Accorder une note</h3>
       <ol>
         <li>Active le micro et pose le téléphone près des cordes, dans une pièce calme.</li>
@@ -84,7 +95,7 @@
     </section>
 
     <section class="panel">
-      <h2>Courbe d'accord <small>écart au tempérament égal (¢) — ligne : cible, points : mesures</small></h2>
+      <h2>Courbe d'accord <small>écart au tempérament égal (¢) · ligne : cible · cercles : diagnostic · points : accord</small></h2>
       <canvas id="curve" height="200"></canvas>
     </section>
 
@@ -98,6 +109,12 @@
       </label>
       <label>Étirement Railsback <output id="stretch-out">100 %</output>
         <input id="stretch" type="range" min="0" max="200" step="5" value="100">
+      </label>
+      <label>Courbe d'étirement
+        <select id="curve-mode">
+          <option value="average">Moyenne (Railsback)</option>
+          <option value="measured">Calculée pour mon piano (après diagnostic)</option>
+        </select>
       </label>
       <label>Partiel mesuré
         <select id="partial">

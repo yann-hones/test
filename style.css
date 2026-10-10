@@ -117,6 +117,20 @@ canvas { display: block; width: 100%; margin-top: 12px; }
 
 .unison-tools { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 
+.diag p { margin: 8px 0; max-width: 70ch; }
+.diag .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.diag label.check { display: flex; gap: 8px; align-items: flex-start; margin: 10px 0; }
+.meter { height: 8px; border-radius: 4px; background: var(--bg); overflow: hidden; }
+.meter div { height: 100%; background: var(--accent); }
+.options { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 8px; }
+.option { display: grid; gap: 4px; text-align: left; padding: 12px 14px; position: relative; }
+.option span { color: var(--muted); font-size: 13px; }
+.option.rec { border-color: var(--accent); border-width: 2px; }
+.option .tag { position: absolute; top: 8px; right: 10px; font-size: 11px; color: var(--accent); font-weight: 600; }
+.warnbox { border-left: 3px solid var(--bad); padding: 6px 10px; background: var(--bg); }
+.key.bad.white { background: color-mix(in srgb, var(--bad) 45%, var(--key-white)); }
+.key.bad.black { background: color-mix(in srgb, var(--bad) 65%, var(--key-black)); }
+
 .help-panel summary { font-weight: 600; cursor: pointer; }
 .help-panel h3 { font-size: 14px; margin: 14px 0 4px; }
 .help-panel ul, .help-panel ol { margin: 0; padding-left: 20px; }

@@ -17,6 +17,11 @@ Accordeur de piano professionnel qui tourne dans le navigateur (ordinateur ou t�
   suivante à la première **pendant qu'elles sonnent ensemble** et dit « tendre » ou « détendre » — pas besoin d'entendre
   l'ondulation (battement) soi-même. Repli possible : valider la corde, ou la mesurer seule contre la note mémorisée
   de la corde 1.
+- **Diagnostic du piano** : on joue les 88 notes, l'appli mesure l'écart de chacune et la raideur des cordes, puis
+  produit un rapport (niveau général, notes à surveiller) et propose un plan : diapason (440 Hz ou celui du piano),
+  une ou deux passes (remise au diapason avec sur-tension de 25 %, puis accord fin), ordre des accordeurs.
+- **Courbe d'accord calculée pour le piano** à partir de l'inharmonicité mesurée (octaves pures 2:1, 4:2 puis 6:3
+  dans le grave), au choix à la place de la courbe de Railsback moyenne.
 - Consignes en clair (« ▲ Tendre », « ▼ Détendre », « ✓ Juste ») et mode d'emploi intégré.
 - Note de référence jouable, écran maintenu allumé pendant l'écoute.
 
@@ -38,7 +43,8 @@ Le micro n'est accessible que sur `https://` ou `localhost` :
 npm start          # ou : python3 -m http.server 8000
 ```
 
-puis ouvrir <http://localhost:8000>. Pour l'utiliser sur un téléphone, publier le dossier en HTTPS (GitHub Pages par exemple).
+puis ouvrir <http://localhost:8000>. Sans serveur : `npm run build` produit `accordeur.html`, un fichier unique
+qu'il suffit d'ouvrir dans Chrome ou Edge. Pour l'utiliser sur un téléphone, publier le dossier en HTTPS (GitHub Pages par exemple).
 
 ## Tests
 
@@ -53,6 +59,7 @@ Les tests vérifient les calculs de justesse et l'analyse du signal sur des note
 - `index.html`, `style.css` : interface
 - `js/tuning.js` : notes, fréquences cibles, tempéraments, courbe de Railsback, inharmonicité
 - `js/pitch.js` : détection de hauteur, mesure des partiels, ajustement de B
+- `js/diagnostic.js` : rapport du diagnostic, courbe calculée, ordre et plan d'accord
 - `js/unison.js` : comparaison de deux cordes qui sonnent ensemble (sens et vitesse des battements)
 - `js/capture-worklet.js` : capture continue du micro (plusieurs secondes de son sans coupure)
 - `js/main.js` : micro, boucle d'analyse, affichage et interactions
