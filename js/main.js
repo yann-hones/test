@@ -670,6 +670,137 @@ function diagPanelHtml() {
     <div class="row"><button data-action="diag-start" class="primary">Commencer le diagnostic</button></div>`;
 }
 
+// ---------- Guide de démarrage ----------
+
+const onboarding = { step: 0, heardTime: 0, lastKey: null };
+
+const OB_STEPS = [
+  () => `<h2 id="ob-title">Bienvenue</h2>
+    <p>Cet accordeur t'aide à accorder ton piano toi-même. Il écoute avec le micro et te dit quoi faire :
+      <b>tendre</b>, <b>détendre</b>, ou <b>c'est juste</b>.</p>
+    <p>Ce guide prend deux minutes : le matériel, où poser l'appareil, un test du micro, puis on commence.</p>`,
+  () => `<h2 id="ob-title">Le matériel</h2>
+    <ul>
+      <li><b>Une clé d'accord</b> (environ 20 à 40 €). Son embout doit s'adapter aux chevilles de ton piano (souvent en étoile).</li>
+      <li><b>Deux à quatre coins en caoutchouc</b>, ou une bande de feutre, pour faire taire des cordes pendant que tu en règles une.</li>
+      <li><b>Une pièce calme</b> : télé, musique et machines éteintes.</li>
+    </ul>
+    <p class="warnbox">Les cordes sont très tendues. Tourne la clé de quelques millimètres à la fois en rejouant la note,
+      et ne dépasse jamais la note visée : une corde trop tendue peut casser.</p>`,
+  () => `<h2 id="ob-title">Où poser l'appareil</h2>
+    <ul>
+      <li><b>Piano droit</b> : ouvre le couvercle du dessus et pose le téléphone sur le pupitre ou sur le dessus du piano, micro vers les cordes.</li>
+      <li><b>Piano à queue</b> : pose-le sur le pupitre ou près des cordes, couvercle ouvert.</li>
+      <li>Ne le tiens pas en main : tu auras besoin de tes deux mains pour la clé et le clavier.</li>
+      <li>Garde l'écran visible : l'appli l'empêche de se mettre en veille pendant l'écoute.</li>
+    </ul>`,
+  () => {
+    const heard = state.signal && state.mode === 'auto';
+    const ok = onboarding.heardTime >= 0.8;
+    const status = !stream
+      ? 'Le micro est coupé.'
+      : ok
+        ? `✓ J'entends ton piano${onboarding.lastKey ? ` (${keyName(onboarding.lastKey, settings.lang)})` : ''}`
+        : heard
+          ? `J'entends : ${keyName(state.key, settings.lang)}…`
+          : 'J\u2019écoute… joue une note.';
+    return `<h2 id="ob-title">Test du micro</h2>
+      <p>Active le micro (ton navigateur va demander l'autorisation), puis joue <b>le La du milieu du clavier</b> plusieurs fois, franchement.</p>
+      <div class="ob-test">
+        ${stream ? '' : '<button data-ob="mic" class="primary">Activer le micro</button>'}
+        <div class="level" aria-hidden="true"><div id="ob-level" style="height:100%;width:0;background:var(--good)"></div></div>
+        <div class="ob-heard ${ok ? 'good' : ''}">${status}</div>
+      </div>
+      <p class="muted-text">${ok ? 'Tout est prêt.' : 'Rien ne s\u2019affiche ? Rapproche l\u2019appareil des cordes et vérifie que le navigateur a bien le droit d\u2019utiliser le micro.'}</p>`;
+  },
+  () => `<h2 id="ob-title">Par quoi commencer ?</h2>
+    <div class="ob-choices">
+      <button data-ob="diag" class="rec"><b>Faire le diagnostic du piano (conseillé)</b>
+        <span>Tu joues les 88 notes une fois ; l'appli te dit où en est le piano et prépare un plan d'accord.</span></button>
+      <button data-ob="note"><b>Accorder une seule note</b>
+        <span>Clique ensuite la note voulue sur le clavier affiché ; l'assistant te guide corde par corde.</span></button>
+      <button data-ob="free"><b>Explorer librement</b>
+        <span>Le guide reste disponible avec le bouton « Guide » en haut.</span></button>
+    </div>`,
+];
+
+let lastObHtml = '';
+function renderOnboarding() {
+  const dlg = $('onboarding');
+  if (!dlg.open) return;
+  const html = OB_STEPS[onboarding.step]();
+  if (html !== lastObHtml) {
+    $('ob-body').innerHTML = html;
+    lastObHtml = html;
+  }
+  $('ob-dots').innerHTML = OB_STEPS.map((_, i) => `<span class="${i <= onboarding.step ? 'on' : ''}"></span>`).join('');
+  $('ob-prev').style.visibility = onboarding.step === 0 ? 'hidden' : 'visible';
+  const last = onboarding.step === OB_STEPS.length - 1;
+  $('ob-next').hidden = last;
+  $('ob-next').textContent = onboarding.step === 3 && onboarding.heardTime < 0.8 ? 'Passer cette étape' : 'Suivant';
+  const lvl = $('ob-level');
+  if (lvl) lvl.style.width = $('level-bar').style.width;
+}
+
+function trackOnboardingMic(dt) {
+  if (!$('onboarding').open || onboarding.step !== 3) return;
+  if (state.signal && state.mode === 'auto') {
+    onboarding.heardTime += dt;
+    onboarding.lastKey = state.key;
+  }
+}
+
+function openOnboarding() {
+  onboarding.step = 0;
+  lastObHtml = '';
+  $('onboarding').showModal();
+  renderOnboarding();
+}
+
+function closeOnboarding() {
+  $('onboarding').close();
+  try {
+    localStorage.setItem('accordeur.onboarded', '1');
+  } catch {
+    // sans stockage, le guide se rouvrira à la prochaine visite
+  }
+}
+
+function obGo(step) {
+  onboarding.step = Math.max(0, Math.min(OB_STEPS.length - 1, step));
+  if (onboarding.step === 3 && state.mode !== 'diagnostic') setMode('auto');
+  renderOnboarding();
+}
+
+function bindOnboarding() {
+  $('guide-btn').addEventListener('click', openOnboarding);
+  $('ob-close').addEventListener('click', closeOnboarding);
+  $('onboarding').addEventListener('cancel', () => closeOnboarding());
+  $('ob-prev').addEventListener('click', () => obGo(onboarding.step - 1));
+  $('ob-next').addEventListener('click', () => obGo(onboarding.step + 1));
+  $('ob-body').addEventListener('click', async (e) => {
+    const action = e.target.closest('[data-ob]')?.dataset.ob;
+    if (action === 'mic') {
+      await startMic();
+      renderOnboarding();
+    } else if (action === 'diag') {
+      closeOnboarding();
+      startDiagnostic();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else if (action === 'note' || action === 'free') {
+      closeOnboarding();
+      if (action === 'note') document.querySelector('.keyboard-scroll')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  });
+  let seen = null;
+  try {
+    seen = localStorage.getItem('accordeur.onboarded');
+  } catch {
+    // stockage indisponible : on montre le guide
+  }
+  if (!seen) openOnboarding();
+}
+
 let lastDiagHtml = '';
 function renderDiagPanel() {
   const html = diagPanelHtml();
@@ -1206,7 +1337,9 @@ function loop(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
   if (capture && ringPos >= buf.length && now - lastAnalysis >= ANALYSIS_INTERVAL) {
-    analyze(Math.min(0.2, (now - lastAnalysis) / 1000));
+    const step = Math.min(0.2, (now - lastAnalysis) / 1000);
+    analyze(step);
+    trackOnboardingMic(step);
     lastAnalysis = now;
   }
   if (state.advanceAt && now >= state.advanceAt) {
@@ -1217,6 +1350,7 @@ function loop(now) {
   drawNeedle();
   drawStrobe(dt);
   renderReadout();
+  renderOnboarding();
   if (now - lastSlowRender > 250) {
     renderPartials();
     renderKeyboard();
@@ -1231,8 +1365,14 @@ updateMeasuredCurve();
 bindSettings();
 bindControls();
 bindDiagPanel();
+bindOnboarding();
 buildKeyboard();
 resetUnison();
 setMode('auto');
 requestAnimationFrame(loop);
 setTimeout(() => scrollToKey(state.key), 0);
+
+// Hors connexion et installation sur l'écran d'accueil (uniquement en https, pas en fichier local).
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}

@@ -5,15 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#14161a">
   <title>Accordeur de piano</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%B9%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="topbar">
     <h1>Accordeur de piano</h1>
     <div class="level" title="Niveau d'entrée du micro"><div id="level-bar"></div></div>
+    <button id="guide-btn" title="Revoir le guide de démarrage">Guide</button>
     <button id="mic-btn" class="primary">Activer le micro</button>
   </header>
+
+  <dialog id="onboarding" aria-labelledby="ob-title">
+    <div class="ob-head">
+      <div id="ob-dots" class="ob-dots" aria-hidden="true"></div>
+      <button id="ob-close" class="ob-close" aria-label="Fermer le guide">×</button>
+    </div>
+    <div id="ob-body"></div>
+    <div class="ob-nav">
+      <button id="ob-prev">Précédent</button>
+      <button id="ob-next" class="primary">Suivant</button>
+    </div>
+  </dialog>
 
   <main>
     <section id="diag-panel" class="panel diag"></section>

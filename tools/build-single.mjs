@@ -11,6 +11,9 @@ main = main.replace("audioCtx.audioWorklet.addModule('js/capture-worklet.js')",
 if (!main.includes('WORKLET_SRC')) throw new Error('worklet non remplacé');
 const js = [`const WORKLET_SRC = ${JSON.stringify(worklet)};`, ...['js/tuning.js', 'js/pitch.js', 'js/unison.js', 'js/diagnostic.js'].map((f) => strip(read(f))), main].join('\n');
 let html = read('index.html');
+// Liens d'installation inutiles pour un fichier local ; l'icône est intégrée.
+html = html.replace(/\s*<link rel="(apple-touch-icon|manifest)"[^>]*>/g, '');
+html = html.replace('href="icons/icon.svg"', `href="data:image/svg+xml,${encodeURIComponent(read('icons/icon.svg'))}"`);
 html = html.replace('<link rel="stylesheet" href="style.css">', `<style>\n${read('style.css')}</style>`);
 html = html.replace('<script type="module" src="js/main.js"></script>', `<script type="module">\n${js.replace(/<\/script/g, '<\\/script')}\n</script>`);
 writeFileSync(out, html);

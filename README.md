@@ -23,6 +23,9 @@ Accordeur de piano professionnel qui tourne dans le navigateur (ordinateur ou t�
 - **Courbe d'accord calculée pour le piano** à partir de l'inharmonicité mesurée (octaves pures 2:1, 4:2 puis 6:3
   dans le grave), au choix à la place de la courbe de Railsback moyenne.
 - Consignes en clair (« ▲ Tendre », « ▼ Détendre », « ✓ Juste ») et mode d'emploi intégré.
+- **Guide de démarrage** à la première visite (matériel, placement de l'appareil, test du micro, par où commencer),
+  réouvrable avec le bouton « Guide ».
+- Installable sur l'écran d'accueil du téléphone et utilisable hors connexion (en https).
 - Note de référence jouable, écran maintenu allumé pendant l'écoute.
 
 ### Comment l'appli trouve le sens de correction de l'unisson
@@ -45,6 +48,17 @@ npm start          # ou : python3 -m http.server 8000
 
 puis ouvrir <http://localhost:8000>. Sans serveur : `npm run build` produit `accordeur.html`, un fichier unique
 qu'il suffit d'ouvrir dans Chrome ou Edge. Pour l'utiliser sur un téléphone, publier le dossier en HTTPS (GitHub Pages par exemple).
+
+## Sur téléphone (GitHub Pages)
+
+Le dépôt étant public, GitHub Pages l'héberge gratuitement en https (indispensable pour le micro) :
+
+1. Sur GitHub, ouvrir le dépôt → **Settings** → **Pages**.
+2. Dans **Build and deployment**, choisir **Deploy from a branch**, puis la branche `ccr-9cad2021-4wireu` et le dossier `/ (root)`, et **Save**.
+3. Après une à deux minutes, l'appli est en ligne sur <https://yann-hones.github.io/test/>.
+
+Sur le téléphone, ouvrir cette adresse puis « Ajouter à l'écran d'accueil » : l'appli s'ouvre alors comme une
+application et reste utilisable sans réseau.
 
 ## Tests
 
