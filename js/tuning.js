@@ -98,3 +98,10 @@ export function defaultPartial(key) {
 export function inharmonicRatio(n, B) {
   return Math.sqrt((1 + B * n * n) / (1 + B));
 }
+
+// Nombre de cordes par note le plus courant : 1 dans l'extrême grave, 2 dans le grave, 3 ensuite.
+export function defaultStrings(key) {
+  if (key <= 8) return 1;
+  if (key <= 26) return 2;
+  return 3;
+}

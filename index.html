@@ -35,6 +35,7 @@
           </div>
         </div>
       </div>
+      <div id="hint" class="hint"><div id="hint-text">Joue la note</div><div id="hint-sub"></div></div>
       <canvas id="needle" height="150" aria-label="Aiguille de justesse"></canvas>
       <canvas id="strobe" height="56" aria-label="Stroboscope"></canvas>
       <div class="actions">
@@ -43,7 +44,34 @@
         <button id="ref-btn" title="Jouer la note de référence (R)">♪ Référence</button>
         <button id="next-btn" title="Note suivante (→)">▶</button>
       </div>
+      <div id="assistant" class="assistant"></div>
     </section>
+
+    <details class="panel help-panel">
+      <summary>Mode d'emploi</summary>
+      <h3>Ce que tu vois</h3>
+      <ul>
+        <li><b>La consigne</b> (« ▲ Tendre », « ▼ Détendre », « ✓ Juste ») dit quoi faire avec la clé d'accord.
+          Tendre = tourner la cheville dans le sens des aiguilles d'une montre.</li>
+        <li><b>Les cents (¢)</b> mesurent l'écart : 100 ¢ = un demi-ton. +5 ¢ = un peu trop aigu, −5 ¢ = un peu trop grave.
+          Vert : moins de 1 ¢ (inaudible) ; orange : jusqu'à 10 ¢ ; rouge : au-delà.</li>
+        <li><b>Les bandes qui défilent</b> (stroboscope) : vers la droite = trop aigu, vers la gauche = trop grave,
+          plus elles vont vite plus c'est faux. Elles s'arrêtent quand c'est juste.</li>
+        <li><b>Les barres « Partiels »</b> : informations pour expert, tu peux les ignorer.</li>
+      </ul>
+      <h3>Accorder une note</h3>
+      <ol>
+        <li>Active le micro et pose le téléphone près des cordes, dans une pièce calme.</li>
+        <li>Clique la touche à accorder sur le clavier affiché (commence par le La4, au milieu).</li>
+        <li>Suis l'assistant : la première corde se règle seule (les autres étouffées avec des coins ou un feutre),
+          puis l'appli compare chaque corde suivante à la première et te dit dans quel sens tourner —
+          inutile d'entendre l'ondulation toi-même.</li>
+        <li>Tourne la clé de quelques millimètres à la fois en rejouant la note.</li>
+      </ol>
+      <h3>Prudence</h3>
+      <p>Les cordes sont très tendues : tourne doucement et ne dépasse pas la note visée, une corde trop tendue peut casser.
+        Si le piano est désaccordé de plus de 30 ¢ partout, fais appel à un accordeur professionnel.</p>
+    </details>
 
     <section class="panel">
       <h2>Partiels <small>écart à n × f₁ (inharmonicité)</small></h2>

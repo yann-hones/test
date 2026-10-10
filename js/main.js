@@ -1,7 +1,8 @@
 import { rms, detectPitch, measurePeak, fitInharmonicity } from './pitch.js';
+import { analyzeUnison } from './unison.js';
 import {
   KEY_COUNT, keyName, isBlackKey, pitchClass, cents, targetFreq, targetOffsetCents,
-  railsbackCents, nearestKey, defaultPartial, inharmonicRatio, TEMPERAMENTS,
+  railsbackCents, nearestKey, defaultPartial, defaultStrings, inharmonicRatio, TEMPERAMENTS,
 } from './tuning.js';
 
 const $ = (id) => document.getElementById(id);
@@ -10,6 +11,9 @@ const GATE = 0.004; // niveau RMS minimal pour analyser
 const ANALYSIS_INTERVAL = 1000 / 15;
 const IN_TUNE_HOLD = 1.0; // secondes dans la tolérance avant de valider une note
 const MAX_PARTIALS = 8;
+const RING_SIZE = 1 << 18; // ≈ 5 s d'historique continu
+const UNISON_INTERVAL = 200; // ms entre deux analyses d'unisson
+const UNISON_SECONDS = 4;
 
 const settings = {
   a4: 440,
@@ -40,12 +44,17 @@ const state = {
   frame: 0,
   partials: [],
   strobePhase: 0,
+  partialFreqs: [], // dernières mesures du partiel suivi (Hz), pour figer la corde de référence
+  // Assistant multi-cordes : step = numéro de la corde en cours (1 = corde de référence).
+  unison: { strings: 3, step: 1, refFreq: null, refN: 1, result: null, okCount: 0, lastRun: 0, lastGood: null, lastGoodAt: 0, alone: false },
 };
 
 let audioCtx = null;
-let analyser = null;
 let stream = null;
-let buf = null;
+let capture = null;
+let buf = new Float32Array(32768); // dernière fenêtre pour l'analyse de hauteur
+const ring = new Float32Array(RING_SIZE);
+let ringPos = 0; // nombre total d'échantillons reçus
 let refOsc = null;
 let wakeLock = null;
 
@@ -92,10 +101,14 @@ async function startMic() {
   }
   audioCtx = audioCtx || new AudioContext();
   await audioCtx.resume();
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 32768;
-  buf = new Float32Array(analyser.fftSize);
-  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  await audioCtx.audioWorklet.addModule('js/capture-worklet.js');
+  capture = new AudioWorkletNode(audioCtx, 'capture');
+  capture.port.onmessage = (e) => pushSamples(e.data);
+  const mute = audioCtx.createGain();
+  mute.gain.value = 0; // le nœud doit être relié à la sortie pour être exécuté
+  audioCtx.createMediaStreamSource(stream).connect(capture).connect(mute).connect(audioCtx.destination);
+  ringPos = 0;
+  ring.fill(0);
   $('mic-btn').textContent = 'Couper le micro';
   $('mic-btn').classList.remove('primary');
   try {
@@ -108,7 +121,8 @@ async function startMic() {
 function stopMic() {
   stream?.getTracks().forEach((t) => t.stop());
   stream = null;
-  analyser = null;
+  capture?.disconnect();
+  capture = null;
   wakeLock?.release().catch(() => {});
   wakeLock = null;
   state.signal = false;
@@ -152,6 +166,18 @@ function stopReference() {
   $('ref-btn').classList.remove('active');
 }
 
+function pushSamples(chunk) {
+  for (let i = 0; i < chunk.length; i++) ring[(ringPos + i) % RING_SIZE] = chunk[i];
+  ringPos += chunk.length;
+}
+
+// Copie des `n` derniers échantillons, dans l'ordre chronologique.
+function recent(n, out = new Float32Array(n)) {
+  const start = ringPos - n;
+  for (let i = 0; i < n; i++) out[i] = ring[(((start + i) % RING_SIZE) + RING_SIZE) % RING_SIZE];
+  return out;
+}
+
 // ---------- Analyse ----------
 
 function autoKey(sr) {
@@ -175,12 +201,19 @@ function autoKey(sr) {
   return state.candidateCount >= 2 ? key : state.key;
 }
 
+function inUnisonStep() {
+  const u = state.unison;
+  return state.mode === 'target' && u.step > 1 && u.step <= u.strings;
+}
+
 function analyze(dt) {
-  analyser.getFloatTimeDomainData(buf);
+  recent(buf.length, buf);
   const sr = audioCtx.sampleRate;
   const level = rms(buf, 4096);
   $('level-bar').style.width = `${Math.min(100, Math.sqrt(level) * 250)}%`;
 
+  if (inUnisonStep() && state.unison.alone) return analyzeAlone(dt, level);
+  if (inUnisonStep()) return analyzeUnisonStep(dt, level);
   if (level < GATE) return noSignal();
   const key = state.mode === 'target' ? state.key : autoKey(sr);
   if (!key) return noSignal();
@@ -202,15 +235,117 @@ function analyze(dt) {
   state.measuredFreq = f1;
   state.partial = n;
   state.signal = true;
+  state.partialFreqs.push(m.freq);
+  if (state.partialFreqs.length > 15) state.partialFreqs.shift();
 
   if (++state.frame % 3 === 0) analyzePartials(key, f1, sr);
-  trackProgress(key, dt);
+  const done = state.mode === 'target' && state.unison.strings > 1 && state.unison.step > state.unison.strings;
+  if (!done) trackProgress(key, dt); // note finie : toutes les cordes sonnent, la mesure n'est qu'indicative
 }
 
 function noSignal() {
   state.signal = false;
   state.inTuneTime = 0;
   state.history = [];
+  state.partialFreqs = [];
+}
+
+// Cordes 2 et 3 : on compare la corde libérée à la corde de référence déjà juste.
+function analyzeUnisonStep(dt, level) {
+  const u = state.unison;
+  const now = performance.now();
+  if (now - u.lastRun < UNISON_INTERVAL) return;
+  u.lastRun = now;
+  const sr = audioCtx.sampleRate;
+  const samples = recent(Math.min(RING_SIZE, Math.round(sr * UNISON_SECONDS)));
+  let r = level < GATE ? null : analyzeUnison(samples, sr, u.refFreq, { fundamental: u.refFreq / u.refN });
+  const confident = r && r.status !== 'unsure';
+  if (confident) {
+    u.lastGood = r;
+    u.lastGoodAt = now;
+  } else if (u.lastGood && now - u.lastGoodAt < 1500) {
+    // juste après une frappe, le son est trop court pour conclure : on garde la dernière consigne fiable
+    u.result = u.lastGood;
+    return;
+  }
+  u.result = r;
+  state.signal = !!r && (r.status === 'high' || r.status === 'low' || r.status === 'slow');
+  state.cents = !r ? null : r.status === 'slow' ? 0 : r.cents;
+  state.measuredFreq = r && state.signal ? (u.refFreq + (r.status === 'slow' ? 0 : r.beat)) / u.refN : null;
+  if (r?.status === 'slow' || (state.signal && Math.abs(r.cents) <= settings.tolerance)) {
+    if (++u.okCount >= 4) finishString();
+  } else {
+    u.okCount = 0;
+  }
+}
+
+// Corde mesurée seule (la corde 1 étouffée) : comparaison directe avec la fréquence mémorisée de la corde 1.
+function analyzeAlone(dt, level) {
+  const u = state.unison;
+  if (level < GATE) return noSignal();
+  const m = measurePeak(buf, audioCtx.sampleRate, u.refFreq, { rangeCents: 70 });
+  if (m.strength < 0.05) return noSignal();
+  state.history.push(cents(m.freq, u.refFreq));
+  if (state.history.length > 5) state.history.shift();
+  const median = [...state.history].sort((a, b) => a - b)[state.history.length >> 1];
+  state.cents = state.cents == null || !state.signal ? median : state.cents + 0.4 * (median - state.cents);
+  state.measuredFreq = m.freq / u.refN;
+  state.signal = true;
+  if (Math.abs(state.cents) <= settings.tolerance) {
+    state.inTuneTime += dt;
+    if (state.inTuneTime >= IN_TUNE_HOLD) finishString();
+  } else {
+    state.inTuneTime = 0;
+  }
+}
+
+function finishString() {
+  const u = state.unison;
+  u.okCount = 0;
+  u.result = null;
+  u.lastGood = null;
+  u.alone = false;
+  state.inTuneTime = 0;
+  state.history = [];
+  if (u.step < u.strings) {
+    u.step++;
+    return;
+  }
+  const p = (progress[state.key] ||= {});
+  p.tuned = true;
+  p.unison = true;
+  save();
+  u.step = u.strings + 1; // terminé
+  state.signal = false;
+  if (settings.autoAdvance && state.key < KEY_COUNT) state.advanceAt = performance.now() + 900;
+}
+
+// La corde de référence est juste : on fige sa fréquence et on passe à la corde suivante.
+function captureReference() {
+  const u = state.unison;
+  const f = [...state.partialFreqs].sort((a, b) => a - b)[state.partialFreqs.length >> 1];
+  u.refFreq = f;
+  u.refN = state.partial;
+  u.step = 2;
+  u.okCount = 0;
+  u.result = null;
+  state.signal = false;
+  state.cents = null;
+}
+
+function resetUnison() {
+  const u = state.unison;
+  u.strings = defaultStringsFor(state.key);
+  u.step = 1;
+  u.refFreq = null;
+  u.result = null;
+  u.lastGood = null;
+  u.alone = false;
+  u.okCount = 0;
+}
+
+function defaultStringsFor(key) {
+  return progress[key]?.strings ?? defaultStrings(key);
 }
 
 function analyzePartials(key, f1, sr) {
@@ -241,7 +376,12 @@ function trackProgress(key, dt) {
   p.cents = state.cents;
   if (Math.abs(state.cents) <= settings.tolerance) {
     state.inTuneTime += dt;
-    if (state.inTuneTime >= IN_TUNE_HOLD && !p.tuned) {
+    const multi = state.mode === 'target' && state.unison.strings > 1 && state.unison.step === 1;
+    if (multi && state.inTuneTime >= IN_TUNE_HOLD && state.partialFreqs.length >= 5) {
+      captureReference();
+      return;
+    }
+    if (!multi && state.inTuneTime >= IN_TUNE_HOLD && !p.tuned) {
       p.tuned = true;
       save();
       if (settings.autoAdvance && state.mode === 'target' && key < KEY_COUNT) {
@@ -416,6 +556,7 @@ function renderReadout() {
   $('partial-used').textContent = partialFor(state.key);
   const B = progress[state.key]?.B;
   $('inharm').textContent = B == null ? '–' : B.toExponential(1);
+  renderAssistant();
   const el = $('cents');
   if (state.signal && state.cents != null) {
     el.textContent = `${formatCents(state.cents)} ¢`;
@@ -426,6 +567,104 @@ function renderReadout() {
     el.textContent = '— ¢';
     el.className = 'cents';
     $('measured-freq').textContent = '–';
+  }
+}
+
+// Consigne en clair : quoi faire avec la clé d'accord.
+function hintText() {
+  const u = state.unison;
+  const name = (n) => `la corde ${n}`;
+  if (state.mode === 'target' && u.strings > 1 && u.step > u.strings) {
+    return { cls: 'good', text: '✓ Note terminée', sub: 'Passe à la note suivante (▶).' };
+  }
+  if (inUnisonStep() && u.alone) {
+    const which = name(u.step);
+    if (!state.signal || state.cents == null) {
+      return { cls: '', text: 'Joue la note', sub: `Seule ${which} doit sonner : étouffe la corde 1${u.step === 3 ? ' et la corde 2' : ''}.` };
+    }
+    const c = state.cents;
+    if (Math.abs(c) <= settings.tolerance) return { cls: 'good', text: '✓ Juste', sub: `${which} est accordée sur la corde 1…` };
+    const small = Math.abs(c) < 5 ? ' (un tout petit peu)' : '';
+    return c > 0
+      ? { cls: 'warn', text: `▼ Détendre ${which}${small}`, sub: 'Trop aiguë par rapport à la corde 1.' }
+      : { cls: 'warn', text: `▲ Tendre ${which}${small}`, sub: 'Trop grave par rapport à la corde 1.' };
+  }
+  if (inUnisonStep()) {
+    const r = u.result;
+    const which = name(u.step);
+    if (!r) return { cls: '', text: 'Joue la note fort et laisse-la sonner', sub: `Comparaison de ${which} avec la corde 1…` };
+    if (r.status === 'unsure') {
+      return {
+        cls: '',
+        text: 'Pas d\u2019ondulation nette',
+        sub: `Vérifie que ${which} n'est plus étouffée et rejoue la note fort. Si elle sonne bien, elle est sans doute déjà juste : valide-la, ou mesure-la seule pour en être sûr.`,
+      };
+    }
+    const beats = `Ondulation : ${Math.abs(r.beat).toFixed(1).replace('.', ',')} par seconde`;
+    if (r.status === 'slow' || Math.abs(r.cents) <= settings.tolerance) {
+      return { cls: 'good', text: `✓ ${which[0].toUpperCase()}${which.slice(1)} est juste`, sub: 'Ne touche plus à la cheville.' };
+    }
+    const small = Math.abs(r.cents) < 5 ? ' (un tout petit peu)' : '';
+    return r.status === 'high'
+      ? { cls: 'warn', text: `▼ Détendre ${which}${small}`, sub: `Trop aiguë par rapport à la corde 1. ${beats}` }
+      : { cls: 'warn', text: `▲ Tendre ${which}${small}`, sub: `Trop grave par rapport à la corde 1. ${beats}` };
+  }
+  if (!state.signal || state.cents == null) return { cls: '', text: 'Joue la note', sub: '' };
+  const c = state.cents;
+  if (Math.abs(c) <= settings.tolerance) return { cls: 'good', text: '✓ Juste', sub: 'Garde la note qui sonne quelques instants…' };
+  const small = Math.abs(c) < 5 ? ' (un tout petit peu)' : '';
+  return c > 0
+    ? { cls: 'warn', text: `▼ Trop aigu : détendre${small}`, sub: '' }
+    : { cls: 'warn', text: `▲ Trop grave : tendre${small}`, sub: '' };
+}
+
+function stepTexts(strings, alone, step) {
+  if (strings === 1) return ['Joue la note et tourne la cheville jusqu\u2019au vert.'];
+  const others = strings === 2 ? 'l\u2019autre corde' : 'les deux autres cordes';
+  const steps = [
+    `<b>Corde 1</b> (celle du milieu, ou la gauche s'il n'y en a que deux) : étouffe ${others} avec un coin ou une bande de feutre, joue la note et règle la corde 1 avec l'aiguille.`,
+    `<b>Corde 2</b> : libère la corde 2${strings === 3 ? ' (la 3 reste étouffée)' : ''} et joue la note. L'appli compare les deux cordes et te dit dans quel sens tourner.`,
+  ];
+  if (strings === 3) steps.push('<b>Corde 3</b> : retire le dernier coin et joue la note. Règle la corde 3 de la même façon.');
+  if (alone && step > 1) {
+    const muted = step === 3 ? 'les cordes 1 et 2' : 'la corde 1';
+    steps[step - 1] = `<b>Corde ${step} seule</b> : étouffe ${muted} pour que seule la corde ${step} sonne, joue la note et suis l'aiguille : elle compare la corde ${step} à la note mémorisée de la corde 1.`;
+  }
+  return steps;
+}
+
+let lastAssistantHtml = '';
+function renderAssistant() {
+  const u = state.unison;
+  const hint = hintText();
+  const hintEl = $('hint');
+  hintEl.className = `hint ${hint.cls}`;
+  $('hint-text').textContent = hint.text;
+  $('hint-sub').textContent = hint.sub;
+
+  let html;
+  if (state.mode !== 'target') {
+    html = '<p class="muted">Clique une touche du clavier (ou ◀ ▶) pour choisir la note à accorder : l\u2019assistant te guidera corde par corde.</p>';
+  } else {
+    const buttons = [1, 2, 3]
+      .map((n) => `<button data-strings="${n}" class="${n === u.strings ? 'active' : ''}">${n}</button>`)
+      .join('');
+    const steps = stepTexts(u.strings, u.alone, u.step)
+      .map((t, i) => {
+        const cls = u.strings === 1 ? 'current' : i + 1 < u.step ? 'done' : i + 1 === u.step ? 'current' : '';
+        return `<li class="${cls}">${t}</li>`;
+      })
+      .join('');
+    const tools = inUnisonStep()
+      ? `<div class="unison-tools"><button data-validate>✓ Valider la corde ${u.step}</button>
+        <button data-alone class="${u.alone ? 'active' : ''}">${u.alone ? 'Revenir à la comparaison des deux cordes' : `Mesurer la corde ${u.step} seule`}</button></div>`
+      : '';
+    html = `<div class="assistant-head"><span>Cordes pour cette note</span><span class="seg">${buttons}</span>
+      <button data-restart>Recommencer la note</button></div><ol class="steps">${steps}</ol>${tools}`;
+  }
+  if (html !== lastAssistantHtml) {
+    $('assistant').innerHTML = html;
+    lastAssistantHtml = html;
   }
 }
 
@@ -502,7 +741,9 @@ function selectKey(key, lock) {
     state.cents = null;
     state.inTuneTime = 0;
     state.partials = [];
+    state.partialFreqs = [];
     state.advanceAt = 0;
+    resetUnison();
     if (refOsc) {
       stopReference();
       toggleReference();
@@ -562,6 +803,25 @@ function bindControls() {
   $('prev-btn').addEventListener('click', () => selectKey(state.key - 1, true));
   $('next-btn').addEventListener('click', () => selectKey(state.key + 1, true));
   $('ref-btn').addEventListener('click', toggleReference);
+  $('assistant').addEventListener('click', (e) => {
+    const strings = e.target.closest('[data-strings]')?.dataset.strings;
+    if (strings) {
+      (progress[state.key] ||= {}).strings = Number(strings);
+      resetUnison();
+      save();
+    } else if (e.target.closest('[data-validate]')) {
+      finishString();
+    } else if (e.target.closest('[data-alone]')) {
+      state.unison.alone = !state.unison.alone;
+      state.unison.result = null;
+      state.unison.lastGood = null;
+      noSignal();
+    } else if (e.target.closest('[data-restart]')) {
+      if (progress[state.key]) progress[state.key].tuned = false;
+      resetUnison();
+      state.inTuneTime = 0;
+    }
+  });
   document.addEventListener('keydown', (e) => {
     if (e.target.closest('input, select, textarea')) return;
     if (e.key === 'ArrowLeft') selectKey(state.key - 1, true);
@@ -589,7 +849,7 @@ let lastSlowRender = 0;
 function loop(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
-  if (analyser && now - lastAnalysis >= ANALYSIS_INTERVAL) {
+  if (capture && ringPos >= buf.length && now - lastAnalysis >= ANALYSIS_INTERVAL) {
     analyze(Math.min(0.2, (now - lastAnalysis) / 1000));
     lastAnalysis = now;
   }
@@ -613,6 +873,7 @@ function loop(now) {
 bindSettings();
 bindControls();
 buildKeyboard();
+resetUnison();
 setMode('auto');
 requestAnimationFrame(loop);
 setTimeout(() => scrollToKey(state.key), 0);
