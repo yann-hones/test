@@ -1,0 +1,11 @@
+{
+  "name": "accordeur-piano",
+  "version": "1.0.0",
+  "description": "Accordeur de piano professionnel dans le navigateur",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "python3 -m http.server 8000"
+  }
+}

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#14161a">
+  <title>Accordeur de piano</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%B9%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Accordeur de piano</h1>
+    <div class="level" title="Niveau d'entrée du micro"><div id="level-bar"></div></div>
+    <button id="mic-btn" class="primary">Activer le micro</button>
+  </header>
+
+  <main>
+    <section class="display" aria-live="polite">
+      <div class="note-row">
+        <div>
+          <div id="mode-badge" class="badge">Auto</div>
+          <div id="note-name" class="note-name">–</div>
+        </div>
+        <div class="readout">
+          <div id="cents" class="cents">— ¢</div>
+          <div class="freqs">
+            <span>Cible <b id="target-freq">–</b> Hz</span>
+            <span>Mesuré <b id="measured-freq">–</b> Hz</span>
+          </div>
+          <div class="freqs">
+            <span>Partiel <b id="partial-used">–</b></span>
+            <span>Étirement <b id="stretch-used">–</b> ¢</span>
+            <span>B <b id="inharm">–</b></span>
+          </div>
+        </div>
+      </div>
+      <canvas id="needle" height="150" aria-label="Aiguille de justesse"></canvas>
+      <canvas id="strobe" height="56" aria-label="Stroboscope"></canvas>
+      <div class="actions">
+        <button id="prev-btn" title="Note précédente (←)">◀</button>
+        <button id="auto-btn" title="Détection automatique (A)">Auto</button>
+        <button id="ref-btn" title="Jouer la note de référence (R)">♪ Référence</button>
+        <button id="next-btn" title="Note suivante (→)">▶</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Partiels <small>écart à n × f₁ (inharmonicité)</small></h2>
+      <div id="partials" class="partials"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Clavier <small><span id="progress-count">0</span>/88 accordées</small></h2>
+      <div class="keyboard-scroll"><div id="keyboard" class="keyboard"></div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Courbe d'accord <small>écart au tempérament égal (¢) — ligne : cible, points : mesures</small></h2>
+      <canvas id="curve" height="200"></canvas>
+    </section>
+
+    <section class="panel settings">
+      <h2>Réglages</h2>
+      <label>Diapason La4 (Hz)
+        <input id="a4" type="number" min="400" max="480" step="0.1" value="440">
+      </label>
+      <label>Tempérament
+        <select id="temperament"></select>
+      </label>
+      <label>Étirement Railsback <output id="stretch-out">100 %</output>
+        <input id="stretch" type="range" min="0" max="200" step="5" value="100">
+      </label>
+      <label>Partiel mesuré
+        <select id="partial">
+          <option value="auto">Auto selon le registre</option>
+          <option value="1">1 (fondamental)</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+        </select>
+      </label>
+      <label>Tolérance (¢)
+        <input id="tolerance" type="number" min="0.2" max="10" step="0.1" value="1">
+      </label>
+      <label>Noms des notes
+        <select id="lang">
+          <option value="fr">Do Ré Mi</option>
+          <option value="en">C D E</option>
+        </select>
+      </label>
+      <label class="check"><input id="auto-advance" type="checkbox"> Passer à la note suivante une fois juste</label>
+      <button id="reset-btn" class="danger">Effacer la progression</button>
+    </section>
+
+    <p class="help">
+      Raccourcis : <kbd>←</kbd>/<kbd>→</kbd> note précédente/suivante, <kbd>A</kbd> mode auto,
+      <kbd>R</kbd> référence, <kbd>Espace</kbd> micro. Cliquez une touche du clavier pour verrouiller une note cible.
+    </p>
+  </main>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
