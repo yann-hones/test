@@ -70,6 +70,7 @@ const state = {
 let audioCtx = null;
 let stream = null;
 let capture = null;
+let micSource = null; // source micro reliée à `capture`, à débrancher avec elle
 let buf = new Float32Array(32768); // dernière fenêtre pour l'analyse de hauteur
 const ring = new Float32Array(RING_SIZE);
 let ringPos = 0; // nombre total d'échantillons reçus
@@ -137,13 +138,30 @@ function partialFor(key) {
 // ---------- Audio ----------
 
 async function startMic() {
+  if (state.micWaitingSince || stream) return; // demande déjà en cours, ou micro déjà actif
+  if (!navigator.mediaDevices?.getUserMedia) {
+    state.micError = 'Ce navigateur ne donne pas accès au micro ici. Ouvre l\u2019appli en https:// ou sur localhost.';
+    return;
+  }
+  // certains navigateurs (Arc…) n'affichent pas toujours la demande d'autorisation : sans retour,
+  // le bouton semblait ne rien faire. On le dit et on explique où autoriser le micro.
+  state.micWaitingSince = performance.now();
+  state.micError = null;
+  $('mic-btn').textContent = 'Autorisation du micro…';
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
   } catch (err) {
-    alert(`Impossible d'accéder au micro : ${err.message}`);
+    state.micError = err.name === 'NotAllowedError'
+      ? 'Micro refusé. Autorise-le pour ce site (icône à gauche de l\u2019adresse), et dans Réglages Système › Confidentialité et sécurité › Microphone pour ton navigateur.'
+      : err.name === 'NotFoundError'
+        ? 'Aucun micro trouvé. Branche ou active un micro, puis réessaie.'
+        : `Impossible d'accéder au micro : ${err.message}`;
+    $('mic-btn').textContent = 'Activer le micro';
     return;
+  } finally {
+    state.micWaitingSince = 0;
   }
   audioCtx = audioCtx || new AudioContext();
   await audioCtx.resume();
@@ -158,7 +176,8 @@ async function startMic() {
   }
   const mute = audioCtx.createGain();
   mute.gain.value = 0; // le nœud doit être relié à la sortie pour être exécuté
-  audioCtx.createMediaStreamSource(stream).connect(capture).connect(mute).connect(audioCtx.destination);
+  micSource = audioCtx.createMediaStreamSource(stream);
+  micSource.connect(capture).connect(mute).connect(audioCtx.destination);
   ringPos = 0;
   ring.fill(0);
   $('mic-btn').textContent = 'Couper le micro';
@@ -173,7 +192,15 @@ async function startMic() {
 function stopMic() {
   stream?.getTracks().forEach((t) => t.stop());
   stream = null;
-  capture?.disconnect();
+  // tout débrancher : une capture restée reliée à l'ancienne source (micro coupé) continuait d'envoyer
+  // des zéros dans le tampon ; après deux coupures, le son analysé n'était plus qu'1 bloc sur 3 (mesures fausses)
+  micSource?.disconnect();
+  micSource = null;
+  if (capture) {
+    if (capture.port) capture.port.onmessage = null;
+    capture.onaudioprocess = null;
+    capture.disconnect();
+  }
   capture = null;
   wakeLock?.release().catch(() => {});
   wakeLock = null;
@@ -283,13 +310,23 @@ function analyze(dt) {
   if (key !== state.key) selectKey(key, false);
 
   const ft = targetFor(key);
-  if (state.mode === 'target' && wrongNoteHeard(sr, ft)) return noSignal();
+  // zone de recherche : ±70 ¢ autour de la cible, élargie jusqu'à la hauteur mesurée au diagnostic
+  let center = ft;
+  let range = 70;
+  if (state.mode === 'target') {
+    // la touche sonne quelque part entre sa hauteur mesurée au diagnostic et sa cible
+    const was = diag.measured[key] != null ? equalFreq(key, 440) * 2 ** (diag.measured[key] / 1200) : ft;
+    if (wrongNoteHeard(sr, key, was, ft, was === ft ? 150 : 50)) return noSignal(); // 50 ¢ hors de cet intervalle : touche voisine
+    // piano très bas accordé directement à 440 Hz : sans cela, la note (−90 ¢) tombait hors de la zone
+    center = Math.sqrt(was * ft);
+    range = 70 + Math.abs(cents(ft, was)) / 2;
+  }
   const n = partialFor(key);
   const B = progress[key]?.B ?? 0;
   const ratio = inharmonicRatio(n, B);
   // fenêtre aussi longue que le son stable le permet (jusqu'à MAX_WINDOW), sans reprendre l'attaque
   const win = Math.round(sr * Math.min(MAX_WINDOW, since - ATTACK));
-  const m = measurePeak(buf, sr, n * ft * ratio, { rangeCents: 70, minSize: Math.max(2048, win) });
+  const m = measurePeak(buf, sr, n * center * ratio, { rangeCents: range, minSize: Math.max(2048, win) });
   // en fin de résonance (sous le seuil de départ), le partiel doit encore nettement dominer le bruit
   if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return noSignal();
 
@@ -319,19 +356,42 @@ function noteCompleted(delay) {
 
 // Note verrouillée : vérifie qu'on joue bien la bonne touche, sinon la mesure fine accrocherait
 // un partiel d'une autre note et donnerait une consigne fausse.
-function wrongNoteHeard(sr, ft, tolerance = 150) {
+// La touche `key` doit sonner entre `lo` et `hi` (Hz) : de sa hauteur actuelle à sa cible. On compare à la
+// hauteur réelle du piano, pas à la théorie : sur un piano trop bas de 90 ¢, la bonne touche sonne presque
+// comme la voisine du dessous, et c'est elle qu'on aurait prise pour une fausse note.
+function wrongNoteHeard(sr, key, lo, hi = lo, tolerance = 150) {
   const r = detectPitch(buf, sr, { size: 8192 });
   if (!r || r.clarity < 0.85) return false;
-  let c = cents(r.freq, ft) % 1200; // une erreur d'octave de la détection n'est pas une fausse note
-  if (c > 600) c -= 1200;
-  if (c < -600) c += 1200;
-  if (Math.abs(c) <= tolerance) {
+  const fold = (c) => {
+    c %= 1200; // une erreur d'octave de la détection n'est pas une fausse note
+    return c > 600 ? c - 1200 : c < -600 ? c + 1200 : c;
+  };
+  const c = fold(cents(r.freq, lo));
+  const span = cents(hi, lo);
+  const dist = c < Math.min(0, span) ? Math.min(0, span) - c : c > Math.max(0, span) ? c - Math.max(0, span) : 0;
+  if (dist <= tolerance) {
     state.wrongNote = null;
     return false;
   }
-  state.wrongNote = nearestKey(r.freq, settings.a4);
+  // touche entendue, comptée sur ce piano : à combien de demi-tons de la hauteur attendue
+  state.wrongNote = Math.min(KEY_COUNT, Math.max(1, key + Math.round(c / 100)));
   state.wrongAt = performance.now();
   return true;
+}
+
+// Décalage local du piano (¢) d'après le diagnostic en cours : médiane de l'écart des notes déjà mesurées
+// les plus proches (en dessous et, quand on refait une note, au-dessus). Il recentre la mesure et la garde
+// contre la mauvaise note sur la hauteur réelle du piano.
+function localOffset(key) {
+  const near = [];
+  for (let dist = 1; dist <= 12 && near.length < 8; dist++) {
+    for (const j of [key - dist, key + dist]) {
+      if (j >= 1 && j <= KEY_COUNT && diag.measured[j] != null) near.push(diag.measured[j] - railsbackCents(j));
+    }
+  }
+  if (!near.length) return { offset: 0, count: 0 }; // dès la 2e note : si la voisine était fausse, on réessaie sur la théorie
+  near.sort((a, b) => a - b);
+  return { offset: near[near.length >> 1], count: near.length };
 }
 
 function noSignal() {
@@ -606,18 +666,29 @@ function analyzeDiagnostic(level) {
   const ref = equalFreq(key, 440);
   const n = partialFor(key);
   const ratio = inharmonicRatio(n, progress[key]?.B ?? 0);
-  const expected = ref * 2 ** (railsbackCents(key) / 1200);
+  // on attend la note là où le piano sonne vraiment (décalage des notes voisines déjà mesurées) : un piano
+  // délaissé peut être si bas que sa note tombe au bord de la zone centrée sur la théorie
+  const { offset, count } = localOffset(key);
+  const expected = ref * 2 ** ((railsbackCents(key) + offset) / 1200);
   // mauvaise note (ou la précédente qui sonne encore) : on n'enregistre rien et on attend la bonne.
   // Tolérance 70 ¢ : la note voisine (100 ¢) est refusée ; au-delà, la mesure ne serait pas fiable.
   // Seulement du fondamental mesuré (grave exclu) jusqu'au Do6 : dans l'aigu, le son s'éteint vite et la
   // détection accroche le bruit de la pièce (« j'entends un Sol2 » sur un Do7), elle refuserait la bonne note.
-  if (n === 1 && key < 64 && wrongNoteHeard(sr, expected, 70)) {
+  if (n === 1 && key < 64 && wrongNoteHeard(sr, key, expected, expected, 70)) {
     d.readings = [];
     return noSignal();
   }
   // comme en accord normal : fenêtre allongée au fil de la résonance, sans reprendre l'attaque
   const win = Math.round(sr * Math.min(MAX_WINDOW, (now - d.struckAt) / 1000 - (key >= 64 ? 0.1 : 0.25)));
-  const m = measurePeak(buf, sr, n * expected * ratio, { rangeCents: 90, minSize: Math.max(2048, win) });
+  // Zone étroite : plus large, le grave accroche d'autres pics (essai à ±150 ¢ : La0 lu −16 ¢ au lieu de −108 ¢).
+  // ±50 ¢ autour des voisines (deux notes voisines diffèrent rarement de plus de 30 ¢), ±90 ¢ sans elles.
+  // Si les voisines ont été mal mesurées, le recentrage peut rater la note : on réessaie alors sur la théorie.
+  const peak = (f, range) => measurePeak(buf, sr, n * f * ratio, { rangeCents: range, minSize: Math.max(2048, win) });
+  let m = peak(expected, count >= 2 ? 50 : 90);
+  const theory = ref * 2 ** (railsbackCents(key) / 1200);
+  if (m.edge && count) m = peak(theory, 90);
+  // toute première note, sans voisine : un piano délaissé peut être bas de plus de 90 ¢, on cherche à côté
+  for (const shift of [-90, 90]) if (m.edge && !count) m = peak(theory * 2 ** (shift / 1200), 90);
   if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return; // fin de résonance : la note doit dominer le bruit
   const f1 = m.freq / (n * ratio);
   const raw = cents(f1, ref);
@@ -1340,10 +1411,19 @@ function renderReadout() {
 // Consigne en clair : quoi faire avec la clé d'accord.
 function hintText() {
   const u = state.unison;
+  if (state.micError) return { cls: 'warn', text: 'Micro indisponible', sub: state.micError };
+  if (state.micWaitingSince && performance.now() - state.micWaitingSince > 3000) {
+    return {
+      cls: 'warn',
+      text: 'En attente de l\u2019autorisation du micro',
+      sub: 'Aucune demande visible ? Clique sur l\u2019icône à gauche de l\u2019adresse et autorise le micro pour ce site. '
+        + 'Vérifie aussi Réglages Système › Confidentialité et sécurité › Microphone : ton navigateur doit être coché (puis relance-le).',
+    };
+  }
   if (state.mode === 'diagnostic') {
     const name = keyName(state.diag.key, settings.lang);
     if (state.wrongNote && performance.now() - state.wrongAt < 1500) {
-      return { cls: 'warn', text: `Ce n'est pas le ${name}`, sub: `J'entends plutôt un ${keyName(state.wrongNote, settings.lang)}. Joue le ${name} et laisse sonner.` };
+      return { cls: 'warn', text: `Ce n'est pas le ${name}`, sub: `J'entends plutôt la touche ${keyName(state.wrongNote, settings.lang)}. Joue le ${name} et laisse sonner.` };
     }
     if (!state.diag.struck) return { cls: '', text: `Joue le ${name}`, sub: 'Une fois, franchement, et laisse sonner.' };
     return { cls: '', text: `Mesure du ${name}…`, sub: 'Laisse la note sonner.' };
@@ -1363,7 +1443,7 @@ function guideHint() {
     return {
       cls: 'warn',
       text: `Ce n'est pas le ${expected}`,
-      sub: `J'entends plutôt un ${keyName(state.wrongNote, settings.lang)}. Joue le ${expected} (touche entourée sur le clavier).`,
+      sub: `J'entends plutôt la touche ${keyName(state.wrongNote, settings.lang)}. Joue le ${expected} (touche entourée sur le clavier).`,
     };
   }
   const name = (n) => `la corde ${n}`;
@@ -1413,7 +1493,14 @@ function guideHint() {
   const small = Math.abs(c) < 5 ? ' (un tout petit peu)' : '';
   return c > 0
     ? { cls: 'warn', text: `▼ Trop aigu : détendre${small}`, sub: '' }
-    : { cls: 'warn', text: `▲ Trop grave : tendre${small}`, sub: '' };
+    : {
+      cls: 'warn',
+      text: `▲ Trop grave : tendre${small}`,
+      // remonter beaucoup d'un coup, hors plan par séances : risque de casse sur un piano délaissé
+      sub: c < -50 && !planStep()
+        ? 'Plus de 50 ¢ à remonter : pas d’un coup, les cordes risquent de casser. Le diagnostic propose une remontée en plusieurs séances.'
+        : '',
+    };
 }
 
 function stepTexts(strings, alone, step) {
