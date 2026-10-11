@@ -154,6 +154,18 @@
       <button id="reset-btn" class="danger">Effacer la progression</button>
     </section>
 
+    <section class="panel tests">
+      <h2>Tester avec Claude</h2>
+      <p>Pour faire vérifier l'appli : fais tes essais, puis copie le journal des mesures et colle-le dans la conversation.
+        Tu peux aussi enregistrer 5 secondes de son et envoyer le fichier.</p>
+      <div class="row">
+        <button id="copy-log-btn" class="primary">Copier le journal de test</button>
+        <button id="rec-btn">Enregistrer 5 s de son</button>
+      </div>
+      <p id="test-status" class="muted-text" aria-live="polite"></p>
+      <textarea id="log-text" readonly hidden rows="6"></textarea>
+    </section>
+
     <p class="help">
       Raccourcis : <kbd>←</kbd>/<kbd>→</kbd> note précédente/suivante, <kbd>A</kbd> mode auto,
       <kbd>R</kbd> référence, <kbd>Espace</kbd> micro. Cliquez une touche du clavier pour verrouiller une note cible.

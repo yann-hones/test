@@ -68,6 +68,13 @@ npm test
 
 Les tests vérifient les calculs de justesse et l'analyse du signal sur des notes de piano synthétiques (détection de hauteur, précision < 0,1 ¢, estimation de B, sens de correction de l'unisson).
 
+## Vérifier à distance
+
+- Dans l'appli, « Tester avec Claude » : **Copier le journal de test** (résumé JSON de chaque note écoutée, du
+  diagnostic et des réglages) et **Enregistrer 5 s de son** (fichier WAV).
+- `node tools/analyze-wav.mjs extrait.wav [touche] [--a4=440] [--unisson=Hz]` analyse un enregistrement avec le
+  même moteur que l'appli : note, écart en cents, inharmonicité, partiels.
+
 ## Structure
 
 - `index.html`, `style.css` : interface

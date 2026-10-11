@@ -159,6 +159,10 @@ dialog#onboarding::backdrop { background: rgb(0 0 0 / 0.45); }
 .ob-choices button span { color: var(--muted); font-size: 13px; }
 .ob-choices button.rec { border: 2px solid var(--accent); }
 
+.tests p { margin: 6px 0; max-width: 70ch; }
+.tests .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+#log-text { width: 100%; font: 12px ui-monospace, monospace; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; }
+
 .help-panel summary { font-weight: 600; cursor: pointer; }
 .help-panel h3 { font-size: 14px; margin: 14px 0 4px; }
 .help-panel ul, .help-panel ol { margin: 0; padding-left: 20px; }

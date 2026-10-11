@@ -263,6 +263,7 @@ function analyze(dt) {
   if (key !== state.key) selectKey(key, false);
 
   const ft = targetFor(key);
+  if (state.mode === 'target' && wrongNoteHeard(sr, ft)) return noSignal();
   const n = partialFor(key);
   const B = progress[key]?.B ?? 0;
   const ratio = inharmonicRatio(n, B);
@@ -277,6 +278,7 @@ function analyze(dt) {
   state.measuredFreq = f1;
   state.partial = n;
   state.signal = true;
+  logReading(key, cents(f1, ft), f1, m.strength, n);
   state.partialFreqs.push(m.freq);
   if (state.partialFreqs.length > 15) state.partialFreqs.shift();
 
@@ -290,7 +292,25 @@ function noteCompleted(delay) {
   if (plan || (settings.autoAdvance && state.key < KEY_COUNT)) state.advanceAt = performance.now() + delay;
 }
 
+// Note verrouillée : vérifie qu'on joue bien la bonne touche, sinon la mesure fine accrocherait
+// un partiel d'une autre note et donnerait une consigne fausse.
+function wrongNoteHeard(sr, ft) {
+  const r = detectPitch(buf, sr, { size: 8192 });
+  if (!r || r.clarity < 0.85) return false;
+  let c = cents(r.freq, ft) % 1200; // une erreur d'octave de la détection n'est pas une fausse note
+  if (c > 600) c -= 1200;
+  if (c < -600) c += 1200;
+  if (Math.abs(c) <= 150) {
+    state.wrongNote = null;
+    return false;
+  }
+  state.wrongNote = nearestKey(r.freq, settings.a4);
+  state.wrongAt = performance.now();
+  return true;
+}
+
 function noSignal() {
+  flushLog();
   state.signal = false;
   state.inTuneTime = 0;
   state.history = [];
@@ -316,6 +336,11 @@ function analyzeUnisonStep(dt, level) {
     return;
   }
   u.result = r;
+  if (r && (r.status !== u.loggedStatus || Math.abs(r.cents - (u.loggedCents ?? 0)) > 1)) {
+    u.loggedStatus = r.status;
+    u.loggedCents = r.cents;
+    pushLog({ mode: 'unisson', key: state.key, corde: u.step, statut: r.status, cents: round1(r.cents), battements: round1(r.beat), fit: round1(r.fit), force: round1(r.ratio) });
+  }
   state.signal = !!r && (r.status === 'high' || r.status === 'low' || r.status === 'slow');
   state.cents = !r ? null : r.status === 'slow' ? 0 : r.cents;
   state.measuredFreq = r && state.signal ? (u.refFreq + (r.status === 'slow' ? 0 : r.beat)) / u.refN : null;
@@ -527,6 +552,7 @@ function analyzeDiagnostic(level) {
   const f1 = m.freq / (n * ratio);
   const raw = cents(f1, ref);
   d.readings.push(raw);
+  logReading(key, raw, f1, m.strength, n);
   state.cents = raw - railsbackCents(key);
   state.measuredFreq = f1;
   state.partial = n;
@@ -668,6 +694,129 @@ function diagPanelHtml() {
     <p>Fais écouter les 88 notes à l'appli (environ 5 minutes). Elle mesure à quel point ton piano est désaccordé et la raideur
       de ses cordes, puis te propose un plan : quel diapason viser, combien de passes, et l'ordre des notes.</p>
     <div class="row"><button data-action="diag-start" class="primary">Commencer le diagnostic</button></div>`;
+}
+
+// ---------- Journal de test ----------
+// Résumé de chaque note écoutée, pour pouvoir vérifier le comportement de l'appli à distance.
+
+const testLog = [];
+const logStart = performance.now();
+let logCur = null;
+
+function round1(v) {
+  return Math.round(v * 10) / 10;
+}
+
+function pushLog(entry) {
+  testLog.push({ t: round1((performance.now() - logStart) / 1000), ...entry });
+  if (testLog.length > 400) testLog.shift();
+}
+
+// cents : écart à la cible (ou au tempérament égal à 440 Hz pendant le diagnostic).
+function logReading(key, c, hz, strength, n) {
+  if (logCur && (logCur.key !== key || logCur.mode !== state.mode)) flushLog();
+  logCur ||= { key, mode: state.mode, n, c: [], hz: [], s: [] };
+  logCur.c.push(c);
+  logCur.hz.push(hz);
+  logCur.s.push(strength);
+}
+
+function flushLog() {
+  const cur = logCur;
+  logCur = null;
+  if (!cur || cur.c.length < 3) return;
+  const sorted = (a) => [...a].sort((x, y) => x - y);
+  const med = (a) => sorted(a)[a.length >> 1];
+  pushLog({
+    mode: cur.mode === 'target' ? (planStep() ? 'accord guidé' : 'note') : cur.mode,
+    key: cur.key,
+    note: keyName(cur.key, 'fr'),
+    partiel: cur.n,
+    mesures: cur.c.length,
+    cents: round1(med(cur.c)),
+    min: round1(sorted(cur.c)[0]),
+    max: round1(sorted(cur.c).at(-1)),
+    hz: Math.round(med(cur.hz) * 100) / 100,
+    force: Math.round((cur.s.reduce((a, b) => a + b, 0) / cur.s.length) * 100) / 100,
+    B: progress[cur.key]?.B != null ? Number(progress[cur.key].B.toPrecision(2)) : null,
+  });
+}
+
+function exportText() {
+  flushLog();
+  const data = {
+    app: 'accordeur-piano',
+    date: new Date().toISOString(),
+    navigateur: navigator.userAgent,
+    echantillonnage: audioCtx?.sampleRate ?? null,
+    reglages: { ...settings },
+    diagnostic: {
+      mesures: Object.fromEntries(Object.entries(diag.measured).map(([k, v]) => [k, round1(v)])),
+      B: Object.fromEntries(Object.entries(diag.B).map(([k, v]) => [k, Number(v.toPrecision(2))])),
+    },
+    plan: plan ? { passes: plan.passes, decalage: round1(plan.shift), etape: plan.index, total: plan.steps.length } : null,
+    journal: testLog,
+  };
+  return `Journal de l'accordeur (à coller dans la conversation avec Claude)\n\`\`\`json\n${JSON.stringify(data)}\n\`\`\``;
+}
+
+async function copyLog() {
+  const text = exportText();
+  try {
+    await navigator.clipboard.writeText(text);
+    flashStatus('Journal copié : colle-le dans la conversation avec Claude.');
+  } catch {
+    // presse-papiers refusé : on affiche le texte à copier à la main
+    const box = $('log-text');
+    box.hidden = false;
+    box.value = text;
+    box.focus();
+    box.select();
+    flashStatus('Copie automatique impossible : le texte est sélectionné, copie-le avec Ctrl+C (ou appui long).');
+  }
+}
+
+function flashStatus(msg) {
+  $('test-status').textContent = msg;
+}
+
+// Enregistre les 5 prochaines secondes du micro dans un fichier WAV (16 bits, mono).
+function recordClip() {
+  if (!stream) {
+    flashStatus('Active d\u2019abord le micro.');
+    return;
+  }
+  const btn = $('rec-btn');
+  btn.disabled = true;
+  const note = keyName(state.key, 'en').replace('♯', 'd');
+  flashStatus('Enregistrement… joue la note maintenant (5 secondes).');
+  setTimeout(() => {
+    const sr = audioCtx.sampleRate;
+    const samples = recent(Math.min(RING_SIZE, Math.round(sr * 5)));
+    const bytes = new DataView(new ArrayBuffer(44 + samples.length * 2));
+    const str = (o, s) => [...s].forEach((ch, i) => bytes.setUint8(o + i, ch.charCodeAt(0)));
+    str(0, 'RIFF');
+    bytes.setUint32(4, 36 + samples.length * 2, true);
+    str(8, 'WAVEfmt ');
+    bytes.setUint32(16, 16, true);
+    bytes.setUint16(20, 1, true);
+    bytes.setUint16(22, 1, true);
+    bytes.setUint32(24, sr, true);
+    bytes.setUint32(28, sr * 2, true);
+    bytes.setUint16(32, 2, true);
+    bytes.setUint16(34, 16, true);
+    str(36, 'data');
+    bytes.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) bytes.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+    a.download = `accordeur-${note}-${new Date().toISOString().slice(11, 19).replaceAll(':', '')}.wav`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    btn.disabled = false;
+    flashStatus(`Extrait enregistré (${a.download}).`);
+  }, 5200);
 }
 
 // ---------- Guide de démarrage ----------
@@ -1045,6 +1194,14 @@ function hintText() {
 
 function guideHint() {
   const u = state.unison;
+  if (state.mode === 'target' && state.wrongNote && performance.now() - state.wrongAt < 1500) {
+    const expected = keyName(state.key, settings.lang);
+    return {
+      cls: 'warn',
+      text: `Ce n'est pas le ${expected}`,
+      sub: `J'entends plutôt un ${keyName(state.wrongNote, settings.lang)}. Joue le ${expected} (touche entourée sur le clavier).`,
+    };
+  }
   const name = (n) => `la corde ${n}`;
   if (state.mode === 'target' && u.strings > 1 && u.step > u.strings) {
     return { cls: 'good', text: '✓ Note terminée', sub: 'Passe à la note suivante (▶).' };
@@ -1222,6 +1379,7 @@ function scrollToKey(key) {
 
 function selectKey(key, lock) {
   key = Math.min(KEY_COUNT, Math.max(1, key));
+  flushLog();
   if (lock) setMode('target');
   if (key !== state.key) {
     state.key = key;
@@ -1231,6 +1389,7 @@ function selectKey(key, lock) {
     state.partials = [];
     state.partialFreqs = [];
     state.advanceAt = 0;
+    state.wrongNote = null;
     resetUnison();
     if (refOsc) {
       stopReference();
@@ -1276,6 +1435,8 @@ function bindSettings() {
     settings.autoAdvance = e.target.checked;
     save();
   });
+  $('copy-log-btn').addEventListener('click', copyLog);
+  $('rec-btn').addEventListener('click', recordClip);
   $('reset-btn').addEventListener('click', () => {
     if (!confirm('Effacer la progression et les mesures d’inharmonicité ?')) return;
     for (const k of Object.keys(progress)) delete progress[k];
