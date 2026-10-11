@@ -159,7 +159,9 @@ export function measurePeak(buf, sampleRate, freq, { rangeCents = 70, periods = 
   let energy = 0;
   for (let i = offset; i < buf.length; i++) energy += buf[i] * buf[i];
   const level = Math.sqrt((2 * energy) / n); // amplitude d'une sinusoïde de même énergie
-  return { freq: bestF, amplitude: bestA, strength: level ? bestA / level : 0 };
+  // pic collé au bord de la zone de recherche : pas de vrai partiel dans la zone, la mesure ne vaut rien
+  const edge = Math.min(bestF - lo, hi - bestF) < (hi - lo) * 0.02;
+  return { freq: bestF, amplitude: bestA, strength: level ? bestA / level : 0, edge };
 }
 
 // Ajustement de f_n² / n² = f0² + f0²·B·n² (corde raide) par moindres carrés.

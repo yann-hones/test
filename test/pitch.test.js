@@ -56,3 +56,10 @@ test('estimation de l’inharmonicité', () => {
   assert.ok(Math.abs(fit.B - B) / B < 0.05, `B estimé ${fit.B}`);
   assert.ok(Math.abs(cents(fit.f0, f0)) < 0.2);
 });
+
+test('pas de partiel dans la zone : mesure signalée comme collée au bord', () => {
+  const buf = pianoTone(110, { partials: 1, noise: 0 });
+  assert.equal(measurePeak(buf, SR, 110).edge, false);
+  // 150 ¢ au-dessus du seul partiel : le maximum se trouve au bord bas de la zone (±70 ¢)
+  assert.equal(measurePeak(buf, SR, 110 * 2 ** (150 / 1200)).edge, true);
+});

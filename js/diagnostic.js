@@ -7,7 +7,23 @@ const MID = [28, 60]; // touches servant à estimer le niveau général (Do3 à 
 const ROUGH_LIMIT = 15; // ¢ : au-delà, une seule passe ne suffit pas (les cordes bougent en se tendant)
 const OVERPULL = 0.25; // part de l'écart à dépasser lors de la passe de remise au diapason
 const OVERPULL_MAX = 15; // ¢
-const RISKY_RAISE = 50; // ¢ : remonter davantage risque de casser des cordes
+const RISKY_RAISE = 50; // ¢ : remonter davantage en une fois risque de casser des cordes
+
+// Historique du piano (demandé au rapport). Il dose la remontée par séance et l'espacement des séances :
+// - un piano ancien supporte mal les grandes corrections : par pas de 10 à 15 ¢ de sur-tension au plus
+//   pour un piano de 40 à 70 ans (Total Piano Care, « Pitch Raise ») ;
+// - un piano délaissé longtemps a des cordes installées à basse tension depuis des années (et souvent
+//   rouillées) : plus de risque de casse, et il redescend davantage entre deux séances ;
+// - après une forte remontée, on réaccorde 2 à 4 semaines plus tard, puis vers 3 mois, puis tous les 6 mois
+//   (même source) ; plusieurs remontées sont souvent nécessaires avant que l'accord tienne (PTG, Kawai).
+export const LAST_TUNING = {
+  recent: 'il y a moins d\u2019un an',
+  few: 'il y a 1 à 3 ans',
+  long: 'il y a 3 à 10 ans',
+  veryLong: 'il y a plus de 10 ans',
+  unknown: 'je ne sais pas',
+};
+export const PIANO_AGE = { young: 'moins de 40 ans', old: '40 ans ou plus', unknown: 'je ne sais pas' };
 
 export const TEMPERAMENT_OCTAVE = [37, 49]; // La3 → La4, accordé en premier
 
@@ -60,9 +76,28 @@ export function curveFromB(B) {
   return c;
 }
 
+// Remontée par séances : pas maximal par séance (¢) et semaines entre deux séances, selon l'historique.
+// En cas de doute (âge ou dernier accord inconnus), on choisit la prudence.
+export function raisePolicy({ lastTuning = 'unknown', age = 'unknown' } = {}) {
+  const neglected = lastTuning === 'veryLong' || lastTuning === 'unknown';
+  const old = age !== 'young';
+  // la passe de remise au diapason sur-tend en plus de 25 % : 20 ¢ de remontée ≈ 25 ¢ de tension ajoutée
+  const step = old && neglected ? 15 : old || neglected ? 20 : 30;
+  return { step, weeks: neglected ? 4 : 3 };
+}
+
+// Réaccords conseillés après une remontée de `raise` ¢ (Total Piano Care) : en semaines après la séance.
+export function followUp(raise) {
+  if (raise >= 25) return [3, 13]; // 2 à 4 semaines, puis vers 3 mois
+  if (raise >= 20) return [4];
+  if (raise >= 10) return [9];
+  return [];
+}
+
 // measured : { key: cents par rapport au tempérament égal à 440 Hz, sans étirement }.
+// history : { lastTuning, age } (voir LAST_TUNING, PIANO_AGE).
 // Renvoie le résumé et les options de diapason proposées.
-export function summarize(measured, curve = null) {
+export function summarize(measured, curve = null, history = {}) {
   const target = (k) => (curve ? curve[k] : railsbackCents(k));
   const dev = {};
   for (const [k, c] of Object.entries(measured)) dev[k] = c - target(Number(k));
@@ -86,14 +121,31 @@ export function summarize(measured, curve = null) {
     if (around.length >= 2 && Math.abs(d - median(around)) > 12) outliers.push({ key, offset: d - median(around) });
   }
   outliers.sort((a, b) => Math.abs(b.offset) - Math.abs(a.offset));
-  const recommended = Math.abs(level) <= 20 ? 'a440' : 'keep';
+  // Piano trop bas de plus d'un pas : on remonte vers 440 Hz en plusieurs séances, à pas égaux.
+  const policy = raisePolicy(history);
+  let staged = null;
+  if (level < -policy.step) {
+    const sessions = Math.ceil(-level / policy.step);
+    const shifts = Array.from({ length: sessions }, (_, i) => level * (1 - (i + 1) / sessions) + 0); // + 0 : pas de « −0 »
+    staged = {
+      ...option(shifts[0]),
+      sessions,
+      step: -level / sessions,
+      weeks: policy.weeks,
+      schedule: shifts.map((shift) => ({ shift, a4: 440 * 2 ** (shift / 1200) })),
+    };
+  }
+  const risky = level < -RISKY_RAISE;
+  // grand écart : la remontée en plusieurs séances est la voie sûre vers 440 Hz
+  const recommended = staged && (risky || -level > 2 * policy.step) ? 'staged' : Math.abs(level) <= 20 ? 'a440' : 'keep';
   return {
     count: Object.keys(measured).length,
     level, // ¢ : niveau général du piano par rapport à la cible à 440 Hz
     deviations: dev,
-    options: { a440: at440, keep },
+    options: staged ? { a440: at440, keep, staged } : { a440: at440, keep },
     recommended,
-    risky: level < -RISKY_RAISE,
+    risky,
+    policy,
     outliers: outliers.slice(0, 8),
   };
 }

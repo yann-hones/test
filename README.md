@@ -20,8 +20,12 @@ Accordeur de piano professionnel qui tourne dans le navigateur (ordinateur ou t�
 - **Diagnostic du piano** : on joue les 88 notes, l'appli mesure l'écart de chacune et la raideur des cordes, puis
   produit un rapport (niveau général, notes à surveiller) et propose un plan : diapason (440 Hz ou celui du piano),
   une ou deux passes (remise au diapason avec sur-tension de 25 %, puis accord fin), ordre des accordeurs.
+  Piano très bas : remontée vers 440 Hz **en plusieurs séances** espacées de 3 à 4 semaines, dosée selon l'âge du
+  piano et la date du dernier accord, avec la date du prochain rendez-vous. Mauvaise touche : on refait seulement
+  cette note ; un diagnostic interrompu se reprend.
 - **Courbe d'accord calculée pour le piano** à partir de l'inharmonicité mesurée (octaves pures 2:1, 4:2 puis 6:3
   dans le grave), au choix à la place de la courbe de Railsback moyenne.
+- Quand la note s'arrête, la dernière mesure (écart, aiguille, partiels) reste affichée, estompée.
 - Consignes en clair (« ▲ Tendre », « ▼ Détendre », « ✓ Juste ») et mode d'emploi intégré.
 - **Guide de démarrage** à la première visite (matériel, placement de l'appareil, test du micro, par où commencer),
   réouvrable avec le bouton « Guide ».

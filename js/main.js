@@ -1,6 +1,6 @@
 import { rms, detectPitch, measurePeak, fitInharmonicity } from './pitch.js';
 import { analyzeUnison, lastStrikeStart } from './unison.js';
-import { smoothB, curveFromB, summarize, buildPlan } from './diagnostic.js';
+import { smoothB, curveFromB, summarize, buildPlan, followUp, LAST_TUNING, PIANO_AGE } from './diagnostic.js';
 import {
   KEY_COUNT, keyName, isBlackKey, pitchClass, cents, targetFreq, targetOffsetCents,
   railsbackCents, stretchCents, equalFreq, nearestKey, defaultPartial, defaultStrings, inharmonicRatio, TEMPERAMENTS,
@@ -8,7 +8,12 @@ import {
 
 const $ = (id) => document.getElementById(id);
 
-const GATE = 0.004; // niveau RMS minimal pour analyser
+const GATE = 0.004; // niveau RMS minimal pour commencer à analyser
+const GATE_RELEASE = 0.0015; // une note déjà suivie l'est jusqu'à ce niveau (fin de résonance)
+const ATTACK = 0.15; // s ignorées après chaque frappe : l'attaque est bruitée et fausse la hauteur
+const MAX_WINDOW = 0.4; // s de son stable au plus par mesure (plus long = plus stable, mais plus lent)
+const PARTIAL_WINDOW = 0.25; // s au plus pour mesurer les partiels (estimation de B)
+const STRIKE_LOOKBACK = 0.8; // s d'historique où chercher la dernière frappe
 const ANALYSIS_INTERVAL = 1000 / 15;
 const IN_TUNE_HOLD = 1.0; // secondes dans la tolérance avant de valider une note
 const MAX_PARTIALS = 8;
@@ -29,11 +34,14 @@ const settings = {
 };
 // Résultats du diagnostic : measured[key] = ¢ par rapport au tempérament égal à 440 Hz ; B[key].
 const diag = load('accordeur.diag', null) || { measured: {}, B: {}, done: false };
+// history : { lastTuning, age } (dose la remontée) ; next : { at, text } prochain rendez-vous conseillé
+diag.history ||= {};
 // Plan d'accord guidé en cours : { passes, shift, steps: [{ key, pass, overpull }], index }
 let plan = load('accordeur.plan', null);
 let measuredCurve = null;
 // progress[key] = { cents, tuned, B }
 const progress = load('accordeur.progress', {});
+const lastPartials = {}; // lastPartials[key] = derniers partiels mesurés, réaffichés quand la note s'éteint
 
 const state = {
   mode: 'auto', // 'auto' | 'target'
@@ -45,6 +53,8 @@ const state = {
   history: [],
   candidate: null,
   candidateCount: 0,
+  sinceStrike: Infinity, // s depuis la dernière frappe détectée
+  fresh: false, // nouvelle frappe : on repart de la première mesure au lieu de lisser
   lastAutoHit: 0,
   inTuneTime: 0,
   advanceAt: 0,
@@ -234,13 +244,14 @@ function autoKey(sr) {
     state.candidate = null;
     return key;
   }
-  // hystérésis : il faut deux détections consécutives pour changer de note
+  // hystérésis : il faut deux détections consécutives pour changer de note, trois si une note
+  // sonne déjà (≈ 200 ms) : la frappe suivante produit un bref son confus qu'il ne faut pas suivre
   if (key === state.candidate) state.candidateCount++;
   else {
     state.candidate = key;
     state.candidateCount = 1;
   }
-  return state.candidateCount >= 2 ? key : state.key;
+  return state.candidateCount >= (state.signal ? 3 : 2) ? key : state.key;
 }
 
 function inUnisonStep() {
@@ -257,8 +268,17 @@ function analyze(dt) {
   if (state.mode === 'diagnostic') return analyzeDiagnostic(level);
   if (inUnisonStep() && state.unison.alone) return analyzeAlone(dt, level);
   if (inUnisonStep()) return analyzeUnisonStep(dt, level);
-  if (level < GATE) return noSignal();
-  const key = state.mode === 'target' ? state.key : autoKey(sr);
+  const since = sinceStrike(sr);
+  if (since < state.sinceStrike - 0.01) {
+    state.history = [];
+    state.fresh = true;
+  }
+  state.sinceStrike = since;
+  // hystérésis : une note suivie l'est jusqu'au bout de sa résonance, bien sous le seuil de départ
+  if (level < (state.signal ? GATE_RELEASE : GATE)) return noSignal();
+  if (since < ATTACK) return; // attaque en cours : on garde l'affichage et on attend le son stable
+  // une note qui s'éteint devient moins nette pour la détection : on garde celle qu'on suivait
+  const key = state.mode === 'target' ? state.key : autoKey(sr) ?? (state.signal ? state.key : null);
   if (!key) return noSignal();
   if (key !== state.key) selectKey(key, false);
 
@@ -267,14 +287,19 @@ function analyze(dt) {
   const n = partialFor(key);
   const B = progress[key]?.B ?? 0;
   const ratio = inharmonicRatio(n, B);
-  const m = measurePeak(buf, sr, n * ft * ratio, { rangeCents: 70 });
-  if (m.strength < 0.05) return noSignal();
+  // fenêtre aussi longue que le son stable le permet (jusqu'à MAX_WINDOW), sans reprendre l'attaque
+  const win = Math.round(sr * Math.min(MAX_WINDOW, since - ATTACK));
+  const m = measurePeak(buf, sr, n * ft * ratio, { rangeCents: 70, minSize: Math.max(2048, win) });
+  // en fin de résonance (sous le seuil de départ), le partiel doit encore nettement dominer le bruit
+  if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return noSignal();
 
   const f1 = m.freq / (n * ratio);
   state.history.push(cents(f1, ft));
   if (state.history.length > 5) state.history.shift();
   const median = [...state.history].sort((a, b) => a - b)[state.history.length >> 1];
-  state.cents = state.cents == null || !state.signal ? median : state.cents + 0.4 * (median - state.cents);
+  const restart = state.cents == null || !state.signal || state.fresh;
+  state.cents = restart ? median : state.cents + 0.4 * (median - state.cents);
+  state.fresh = false;
   state.measuredFreq = f1;
   state.partial = n;
   state.signal = true;
@@ -282,7 +307,7 @@ function analyze(dt) {
   state.partialFreqs.push(m.freq);
   if (state.partialFreqs.length > 15) state.partialFreqs.shift();
 
-  if (++state.frame % 3 === 0) analyzePartials(key, f1, sr);
+  if (++state.frame % 3 === 0 && level >= GATE && m.strength >= 0.2) analyzePartials(key, f1, sr, win);
   const done = state.mode === 'target' && state.unison.strings > 1 && state.unison.step > state.unison.strings;
   if (!done) trackProgress(key, dt); // note finie : toutes les cordes sonnent, la mesure n'est qu'indicative
 }
@@ -294,13 +319,13 @@ function noteCompleted(delay) {
 
 // Note verrouillée : vérifie qu'on joue bien la bonne touche, sinon la mesure fine accrocherait
 // un partiel d'une autre note et donnerait une consigne fausse.
-function wrongNoteHeard(sr, ft) {
+function wrongNoteHeard(sr, ft, tolerance = 150) {
   const r = detectPitch(buf, sr, { size: 8192 });
   if (!r || r.clarity < 0.85) return false;
   let c = cents(r.freq, ft) % 1200; // une erreur d'octave de la détection n'est pas une fausse note
   if (c > 600) c -= 1200;
   if (c < -600) c += 1200;
-  if (Math.abs(c) <= 150) {
+  if (Math.abs(c) <= tolerance) {
     state.wrongNote = null;
     return false;
   }
@@ -420,14 +445,30 @@ function defaultStringsFor(key) {
   return progress[key]?.strings ?? defaultStrings(key);
 }
 
-function analyzePartials(key, f1, sr) {
+// Temps écoulé depuis la dernière frappe (s), Infinity si elle est plus ancienne que l'historique regardé.
+function sinceStrike(sr) {
+  const len = Math.round(sr * STRIKE_LOOKBACK);
+  const idx = lastStrikeStart(recent(len), sr);
+  return idx > 0 ? (len - idx) / sr : Infinity;
+}
+
+// Écart moyen (¢) entre les partiels mesurés et le modèle de corde raide : grand = ajustement douteux.
+function fitError(found, fit) {
+  const sq = found.reduce((s, p) => s + cents(p.freq, p.n * fit.f0 * Math.sqrt(1 + fit.B * p.n * p.n)) ** 2, 0);
+  return Math.sqrt(sq / found.length);
+}
+
+function analyzePartials(key, f1, sr, win = 0) {
   const found = [];
-  let B = progress[key]?.B ?? 0;
+  // on part d'une corde sans raideur et on affine partiel après partiel : repartir d'un B mémorisé
+  // faux ferait chercher les partiels suivants au mauvais endroit, et l'erreur s'entretiendrait
+  let B = 0;
+  const minSize = Math.max(2048, Math.min(win, Math.round(sr * PARTIAL_WINDOW)));
   for (let n = 1; n <= MAX_PARTIALS; n++) {
     const expected = n * f1 * inharmonicRatio(n, B);
     if (expected > Math.min(12000, sr / 2.2)) break;
-    const m = measurePeak(buf, sr, expected, { rangeCents: 40 });
-    if (m.strength > 0.03) {
+    const m = measurePeak(buf, sr, expected, { rangeCents: 40, minSize });
+    if (!m.edge && m.strength > 0.05) {
       found.push({ n, freq: m.freq, strength: m.strength });
       // affine B au fil des partiels pour mieux centrer la recherche des suivants
       const fit = fitInharmonicity(found);
@@ -435,17 +476,20 @@ function analyzePartials(key, f1, sr) {
     }
   }
   const fit = fitInharmonicity(found);
-  if (fit && fit.B >= 0 && fit.B < 0.05) {
+  if (fit && found.length >= 4 && fit.B >= 0 && fit.B < 0.05 && fitError(found, fit) < 2) {
     const p = (progress[key] ||= {});
     p.B = p.B == null ? fit.B : p.B + 0.2 * (fit.B - p.B);
   }
   const base = fit?.f0 ?? f1;
   state.partials = found.map((p) => ({ ...p, dev: cents(p.freq, p.n * base) }));
+  if (found.length) lastPartials[key] = state.partials;
 }
 
 function trackProgress(key, dt) {
   const p = (progress[key] ||= {});
   p.cents = state.cents;
+  p.hz = state.measuredFreq; // dernière mesure, réaffichée quand la note ne sonne plus
+  p.at = Date.now();
   if (Math.abs(state.cents) <= tol()) {
     state.inTuneTime += dt;
     const multi = state.mode === 'target' && state.unison.strings > 1 && state.unison.step === 1;
@@ -504,8 +548,23 @@ function diagRecord() {
   diag.measured[d.key] = vals[vals.length >> 1];
   if (progress[d.key]?.B != null) diag.B[d.key] = progress[d.key].B;
   save();
-  if (d.key >= KEY_COUNT) finishDiagnostic();
-  else diagGoto(d.key + 1);
+  const next = nextUnmeasured(d.key + 1);
+  if (next) diagGoto(next);
+  else finishDiagnostic();
+}
+
+// Première note pas encore mesurée à partir de `from` : après avoir refait une note, on reprend là où on en était.
+function nextUnmeasured(from) {
+  for (let k = from; k <= KEY_COUNT; k++) if (diag.measured[k] == null) return k;
+  return null;
+}
+
+// Diagnostic interrompu : on garde les notes déjà mesurées et on repart de la première qui manque.
+function resumeDiagnostic() {
+  state.diagBackup = { diag: JSON.parse(JSON.stringify(diag)), plan };
+  setMode('diagnostic');
+  diagGoto(nextUnmeasured(1) ?? KEY_COUNT);
+  if (!stream) startMic();
 }
 
 function finishDiagnostic() {
@@ -534,8 +593,9 @@ function analyzeDiagnostic(level) {
       return noSignal();
     }
   }
-  if (now - d.struckAt < 250) return;
-  if (level < GATE) {
+  // les aigus s'éteignent vite : attendre 250 ms après la frappe, c'était souvent rater toute la note
+  if (now - d.struckAt < (key >= 64 ? 100 : 250)) return;
+  if (level < GATE_RELEASE) {
     if (d.readings.length >= 3) diagRecord();
     else {
       d.struck = false;
@@ -547,8 +607,18 @@ function analyzeDiagnostic(level) {
   const n = partialFor(key);
   const ratio = inharmonicRatio(n, progress[key]?.B ?? 0);
   const expected = ref * 2 ** (railsbackCents(key) / 1200);
-  const m = measurePeak(buf, sr, n * expected * ratio, { rangeCents: 90 });
-  if (m.strength < 0.05) return;
+  // mauvaise note (ou la précédente qui sonne encore) : on n'enregistre rien et on attend la bonne.
+  // Tolérance 70 ¢ : la note voisine (100 ¢) est refusée ; au-delà, la mesure ne serait pas fiable.
+  // Seulement du fondamental mesuré (grave exclu) jusqu'au Do6 : dans l'aigu, le son s'éteint vite et la
+  // détection accroche le bruit de la pièce (« j'entends un Sol2 » sur un Do7), elle refuserait la bonne note.
+  if (n === 1 && key < 64 && wrongNoteHeard(sr, expected, 70)) {
+    d.readings = [];
+    return noSignal();
+  }
+  // comme en accord normal : fenêtre allongée au fil de la résonance, sans reprendre l'attaque
+  const win = Math.round(sr * Math.min(MAX_WINDOW, (now - d.struckAt) / 1000 - (key >= 64 ? 0.1 : 0.25)));
+  const m = measurePeak(buf, sr, n * expected * ratio, { rangeCents: 90, minSize: Math.max(2048, win) });
+  if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return; // fin de résonance : la note doit dominer le bruit
   const f1 = m.freq / (n * ratio);
   const raw = cents(f1, ref);
   d.readings.push(raw);
@@ -557,7 +627,7 @@ function analyzeDiagnostic(level) {
   state.measuredFreq = f1;
   state.partial = n;
   state.signal = true;
-  if (++state.frame % 3 === 0) analyzePartials(key, f1, sr);
+  if (++state.frame % 3 === 0 && m.strength >= 0.2) analyzePartials(key, f1, sr, win);
   const recentReadings = d.readings.slice(-5);
   const spread = Math.max(...recentReadings) - Math.min(...recentReadings);
   const stable = recentReadings.length === 5 && spread <= (key < 20 || key > 80 ? 3 : 2);
@@ -566,14 +636,53 @@ function analyzeDiagnostic(level) {
 }
 
 function startPlan(choice) {
-  const summary = summarize(diag.measured, curveArray());
+  const summary = summarize(diag.measured, curveArray(), diag.history);
   const opt = summary.options[choice];
   settings.a4 = Math.round(opt.a4 * 10) / 10;
   $('a4').value = settings.a4;
   plan = { ...buildPlan(summary.deviations, opt.shift, opt.passes), index: 0, choice };
+  diag.next = nextAppointment(choice, summary, opt);
   for (const p of Object.values(progress)) p.tuned = false;
   setMode('target');
   resumePlan();
+}
+
+// Rendez-vous conseillé après cette séance : séance suivante de la remontée, ou réaccord de contrôle.
+function nextAppointment(choice, summary, opt) {
+  const raise = opt.shift - summary.level; // ¢ de tension ajoutée aujourd'hui
+  const inWeeks = (w) => Date.now() + w * 7 * 864e5;
+  if (choice === 'staged' && opt.sessions > 1) {
+    return {
+      at: inWeeks(opt.weeks),
+      text: `Remontée : séance 1 sur ${opt.sessions} faite (La ${fmtHz(opt.a4)} Hz). Laisse le piano se stabiliser, puis refais un
+        diagnostic : l'appli proposera la remontée suivante, vers La ${fmtHz(opt.schedule[1].a4)} Hz.`,
+    };
+  }
+  const weeks = followUp(raise);
+  if (!weeks.length) return null;
+  return {
+    at: inWeeks(weeks[0]),
+    text: `Le piano a été remonté de ${Math.round(raise)} ¢ : il va encore bouger un peu. Refais un diagnostic et un accord fin à cette date${
+      weeks[1] ? `, puis encore vers ${fmtDate(inWeeks(weeks[1]))}` : ''}, ensuite tous les 6 mois.`,
+  };
+}
+
+function fmtDate(t) {
+  return new Date(t).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long' });
+}
+
+function nextHtml() {
+  const n = diag.next;
+  if (!n) return '';
+  const late = Date.now() >= n.at;
+  return `<p class="infobox"><b>${late ? 'C\u2019est le moment' : `Prochain rendez-vous vers le ${fmtDate(n.at)}`}.</b> ${n.text}</p>`;
+}
+
+function historyHtml() {
+  const select = (name, values, label) => `<label>${label}
+      <select data-history="${name}">${Object.entries(values).map(([v, t]) =>
+        `<option value="${v}" ${(diag.history[name] ?? 'unknown') === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+  return `<div class="history">${select('lastTuning', LAST_TUNING, 'Dernier accord')}${select('age', PIANO_AGE, 'Âge du piano')}</div>`;
 }
 
 function resumePlan() {
@@ -630,13 +739,16 @@ function diagPanelHtml() {
       <div class="meter"><div style="width:${(measuredCount / KEY_COUNT) * 100}%"></div></div>
       <p>Joue chaque note demandée <b>une fois, franchement</b>, et laisse-la sonner : l'appli passe seule à la suivante.
         Inutile d'étouffer les cordes. Une note muette ou douteuse : passe-la.</p>
-      <div class="row"><button data-action="diag-skip">Passer cette note</button>
+      <p>Mauvaise touche ? Reviens en arrière avec ◀ ou en cliquant la note sur le clavier : seule cette note sera refaite.</p>
+      <div class="row">${k > 1 ? '<button data-action="diag-back">◀ Note précédente</button>' : ''}
+        <button data-action="diag-skip">Passer cette note</button>
         <button data-action="diag-finish" class="primary">Terminer et voir le rapport</button>
         <button data-action="diag-cancel">Annuler</button></div>`;
   }
   if (plan && plan.index >= plan.steps.length) {
     return `<h2>Accord terminé</h2>
       <p>Joue quelques accords et gammes pour vérifier. Un nouveau diagnostic permet de contrôler le résultat.</p>
+      ${nextHtml()}
       <div class="row"><button data-action="diag-start" class="primary">Refaire un diagnostic</button>
         <button data-action="plan-stop">Fermer</button></div>`;
   }
@@ -657,7 +769,7 @@ function diagPanelHtml() {
         <button data-action="plan-stop">Arrêter l'accord guidé</button></div>`;
   }
   if (diag.done) {
-    const s = summarize(diag.measured, curveArray());
+    const s = summarize(diag.measured, curveArray(), diag.history);
     const lvl = Math.abs(s.level) < 3
       ? 'Ton piano est globalement au bon diapason (La 440 Hz).'
       : `Ton piano est en moyenne <b>${Math.abs(Math.round(s.level))} ¢ trop ${s.level < 0 ? 'bas' : 'haut'}</b> : son La4 sonne vers ${fmtHz(s.options.keep.a4)} Hz.`;
@@ -673,27 +785,43 @@ function diagPanelHtml() {
     const passes = (o) => (o.passes === 2 ? '2 passes : remise au diapason, puis accord fin' : '1 passe d\u2019accord fin');
     const card = (id, title, detail) => `<button class="option ${s.recommended === id ? 'rec' : ''}" data-action="plan-${id}">
         ${s.recommended === id ? '<span class="tag">Conseillé</span>' : ''}<b>${title}</b><span>${passes(s.options[id])}</span><span>${detail}</span></button>`;
+    const st = s.options.staged;
+    const stagedCard = st
+      ? card('staged', `Remonter vers 440 Hz en ${st.sessions} séances`,
+        `Environ ${Math.round(st.step)} ¢ par séance, une séance toutes les ${st.weeks} semaines : aujourd'hui La ${fmtHz(st.a4)} Hz, puis ${
+          st.schedule.slice(1).map((x) => `${fmtHz(x.a4)} Hz`).join(', puis ')}. Les cordes s'habituent peu à peu à la tension : la voie sûre vers 440 Hz.`)
+      : '';
     const options = Math.abs(s.level) < 3
       ? `<div class="options">${card('a440', 'Lancer l\u2019accord guidé', 'Au La 440 Hz.')}</div>`
       : `<div class="options">
-          ${card('a440', 'Accorder au La 440 Hz', 'Le diapason standard : le piano jouera juste avec les autres instruments.')}
+          ${stagedCard}
+          ${s.risky ? '' : card('a440', 'Accorder au La 440 Hz', 'Le diapason standard : le piano jouera juste avec les autres instruments.')}
           ${card('keep', `Garder le diapason actuel (La ${fmtHz(s.options.keep.a4)} Hz)`, 'Moins de tension ajoutée, plus sûr pour un piano ancien. Juste avec lui-même, mais pas avec les autres instruments.')}
         </div>`;
     const risky = s.risky
-      ? '<p class="warnbox">Remonter le piano de plus de 50 ¢ risque de casser des cordes. Garde plutôt le diapason actuel, ou fais appel à un accordeur professionnel.</p>'
+      ? `<p class="warnbox">Remonter le piano de plus de 50 ¢ d'un coup risque de casser des cordes. Remonte-le plutôt en plusieurs
+          séances espacées, ou garde le diapason actuel. Si des cordes sont rouillées, demande d'abord l'avis d'un accordeur.</p>`
+      : '';
+    const history = s.level < -3
+      ? `<p>Pour doser la remontée, dis-en un peu plus sur le piano (dans le doute, l'appli choisit la prudence) :</p>${historyHtml()}`
       : '';
     return `<h2>Rapport du diagnostic <small>${s.count} / ${KEY_COUNT} notes mesurées</small></h2>
       <p>${lvl} Une fois ce niveau général mis de côté, une note typique est fausse de ${Math.round(s.options.keep.typical)} ¢.</p>
       ${outliers}${missing ? `<p>${missing} note(s) n'ont pas été mesurées : elles seront quand même accordées.</p>` : ''}
-      ${risky}${curve}
+      ${nextHtml()}${risky}${history}${curve}
       <p>Choisis comment accorder, l'appli te guidera note par note dans le bon ordre :</p>
       ${options}
       <div class="row"><button data-action="diag-start">Refaire le diagnostic</button></div>`;
   }
+  const resume = !diag.done && measuredCount > 0
+    ? `<p>Un diagnostic a été interrompu : ${measuredCount} note(s) déjà mesurée(s).</p>
+      <div class="row"><button data-action="diag-resume" class="primary">Reprendre le diagnostic</button>
+        <button data-action="diag-start">Recommencer à zéro</button></div>`
+    : '<div class="row"><button data-action="diag-start" class="primary">Commencer le diagnostic</button></div>';
   return `<h2>Diagnostic du piano</h2>
     <p>Fais écouter les 88 notes à l'appli (environ 5 minutes). Elle mesure à quel point ton piano est désaccordé et la raideur
       de ses cordes, puis te propose un plan : quel diapason viser, combien de passes, et l'ordre des notes.</p>
-    <div class="row"><button data-action="diag-start" class="primary">Commencer le diagnostic</button></div>`;
+    ${resume}`;
 }
 
 // ---------- Journal de test ----------
@@ -960,9 +1088,17 @@ function renderDiagPanel() {
 }
 
 function bindDiagPanel() {
+  $('diag-panel').addEventListener('change', (e) => {
+    const field = e.target.dataset.history;
+    if (!field) return;
+    diag.history[field] = e.target.value;
+    save();
+  });
   $('diag-panel').addEventListener('click', (e) => {
     const action = e.target.closest('[data-action]')?.dataset.action;
     if (action === 'diag-start') startDiagnostic();
+    else if (action === 'diag-resume') resumeDiagnostic();
+    else if (action === 'diag-back') diagGoto(state.diag.key - 1);
     else if (action === 'diag-skip') diagGoto(state.diag.key + 1 > KEY_COUNT ? KEY_COUNT : state.diag.key + 1);
     else if (action === 'diag-finish') finishDiagnostic();
     else if (action === 'diag-cancel') {
@@ -973,7 +1109,7 @@ function bindDiagPanel() {
       }
       setMode('auto');
       save();
-    } else if (action === 'plan-a440' || action === 'plan-keep') startPlan(action.slice(5));
+    } else if (action === 'plan-a440' || action === 'plan-keep' || action === 'plan-staged') startPlan(action.slice(5));
     else if (action === 'plan-resume') resumePlan();
     else if (action === 'plan-stop') {
       plan = null;
@@ -1050,10 +1186,13 @@ function drawNeedle() {
     }
   }
 
-  const c = state.signal && state.cents != null ? state.cents : 0;
+  // note éteinte : l'aiguille reste, estompée, sur la dernière mesure de la note
+  const live = state.signal && state.cents != null;
+  const last = live ? null : lastReading(state.key);
+  const c = live ? state.cents : last ? last.cents : 0;
   const a = angle(c);
-  ctx.strokeStyle = state.signal ? colorFor(c) : muted;
-  ctx.globalAlpha = state.signal ? 1 : 0.35;
+  ctx.strokeStyle = live || last ? colorFor(c) : muted;
+  ctx.globalAlpha = live ? 1 : last ? 0.45 : 0.35;
   ctx.lineWidth = 3;
   ctx.lineCap = 'round';
   ctx.beginPath();
@@ -1150,6 +1289,21 @@ function drawCurve() {
   ctx.globalAlpha = 1;
 }
 
+// Dernière mesure de la note, recalculée par rapport à la cible actuelle (diapason ou courbe ont pu changer).
+function lastReading(key) {
+  const p = progress[key];
+  if (state.mode === 'diagnostic' || !p?.hz) return null;
+  return { cents: cents(p.hz, targetFor(key)), hz: p.hz, at: p.at };
+}
+
+function agoText(at) {
+  const s = Math.round((Date.now() - at) / 1000);
+  if (!at || s < 0) return '';
+  if (s < 60) return `il y a ${s} s`;
+  if (s < 3600) return `il y a ${Math.round(s / 60)} min`;
+  return new Date(at).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
 function renderReadout() {
   const opts = tuningOpts();
   $('note-name').textContent = keyName(state.key, settings.lang);
@@ -1169,9 +1323,16 @@ function renderReadout() {
     const a = Math.abs(state.cents);
     el.className = `cents ${a <= tol() ? 'good' : a <= 10 ? 'warn' : 'bad'}`;
     $('measured-freq').textContent = state.measuredFreq.toFixed(2);
+  } else if (lastReading(state.key)) {
+    const last = lastReading(state.key);
+    el.textContent = `${formatCents(last.cents)} ¢`;
+    el.className = 'cents last';
+    el.title = `Dernière mesure, ${agoText(last.at)}`;
+    $('measured-freq').textContent = last.hz.toFixed(2);
   } else {
     el.textContent = '— ¢';
     el.className = 'cents';
+    el.title = '';
     $('measured-freq').textContent = '–';
   }
 }
@@ -1181,6 +1342,9 @@ function hintText() {
   const u = state.unison;
   if (state.mode === 'diagnostic') {
     const name = keyName(state.diag.key, settings.lang);
+    if (state.wrongNote && performance.now() - state.wrongAt < 1500) {
+      return { cls: 'warn', text: `Ce n'est pas le ${name}`, sub: `J'entends plutôt un ${keyName(state.wrongNote, settings.lang)}. Joue le ${name} et laisse sonner.` };
+    }
     if (!state.diag.struck) return { cls: '', text: `Joue le ${name}`, sub: 'Une fois, franchement, et laisse sonner.' };
     return { cls: '', text: `Mesure du ${name}…`, sub: 'Laisse la note sonner.' };
   }
@@ -1238,7 +1402,12 @@ function guideHint() {
       ? { cls: 'warn', text: `▼ Détendre ${which}${small}`, sub: `Trop aiguë par rapport à la corde 1. ${beats}` }
       : { cls: 'warn', text: `▲ Tendre ${which}${small}`, sub: `Trop grave par rapport à la corde 1. ${beats}` };
   }
-  if (!state.signal || state.cents == null) return { cls: '', text: 'Joue la note', sub: '' };
+  if (!state.signal || state.cents == null) {
+    const last = lastReading(state.key);
+    if (!last) return { cls: '', text: 'Joue la note', sub: '' };
+    const verdict = Math.abs(last.cents) <= tol() ? 'juste' : last.cents > 0 ? 'trop aiguë' : 'trop grave';
+    return { cls: '', text: 'Joue la note', sub: `Dernière mesure ${agoText(last.at)} : ${formatCents(last.cents)} ¢ (${last.hz.toFixed(2)} Hz), ${verdict}.` };
+  }
   const c = state.cents;
   if (Math.abs(c) <= tol()) return { cls: 'good', text: '✓ Juste', sub: 'Garde la note qui sonne quelques instants…' };
   const small = Math.abs(c) < 5 ? ' (un tout petit peu)' : '';
@@ -1305,10 +1474,13 @@ function formatCents(c) {
 
 function renderPartials() {
   const box = $('partials');
-  const max = Math.max(0.05, ...state.partials.map((p) => p.strength));
+  // note éteinte : on garde, estompés, les derniers partiels mesurés pour cette note
+  const partials = state.signal ? state.partials : (lastPartials[state.key] ?? []);
+  box.classList.toggle('last', !state.signal && partials.length > 0);
+  const max = Math.max(0.05, ...partials.map((p) => p.strength));
   box.innerHTML = '';
   for (let n = 1; n <= MAX_PARTIALS; n++) {
-    const p = state.signal ? state.partials.find((q) => q.n === n) : null;
+    const p = partials.find((q) => q.n === n);
     const div = document.createElement('div');
     div.className = 'partial';
     div.innerHTML = `<div class="bar"><div class="fill" style="height:${p ? (p.strength / max) * 100 : 0}%"></div></div>
@@ -1440,6 +1612,7 @@ function bindSettings() {
   $('reset-btn').addEventListener('click', () => {
     if (!confirm('Effacer la progression et les mesures d’inharmonicité ?')) return;
     for (const k of Object.keys(progress)) delete progress[k];
+  for (const k of Object.keys(lastPartials)) delete lastPartials[k];
     save();
     renderKeyboard();
   });
