@@ -13,13 +13,15 @@ const GATE_RELEASE = 0.0015; // une note déjà suivie l'est jusqu'à ce niveau 
 const ATTACK = 0.15; // s ignorées après chaque frappe : l'attaque est bruitée et fausse la hauteur
 const MAX_WINDOW = 0.4; // s de son stable au plus par mesure (plus long = plus stable, mais plus lent)
 const PARTIAL_WINDOW = 0.25; // s au plus pour mesurer les partiels (estimation de B)
-const STRIKE_LOOKBACK = 0.8; // s d'historique où chercher la dernière frappe
+const STRIKE_LOOKBACK = 0.8;
+const WRONG_HOLD = 200; // ms pendant lesquels une autre note doit s'entendre avant de le signaler
+const STRIKE_LOCK = 0.6; // s après la frappe : au-delà, le mode Auto garde la note suivie // s d'historique où chercher la dernière frappe
 const ANALYSIS_INTERVAL = 1000 / 15;
 const IN_TUNE_HOLD = 1.0; // secondes dans la tolérance avant de valider une note
 const MAX_PARTIALS = 8;
 const RING_SIZE = 1 << 18; // ≈ 5 s d'historique continu
 const UNISON_INTERVAL = 200; // ms entre deux analyses d'unisson
-const UNISON_SECONDS = 4;
+const UNISON_SECONDS = 2; // s de son analysés : court pour suivre la cheville qu'on tourne pendant que la note sonne
 
 const settings = {
   a4: 440,
@@ -64,7 +66,7 @@ const state = {
   partialFreqs: [], // dernières mesures du partiel suivi (Hz), pour figer la corde de référence
   diag: { key: 1, armedAt: 0, struck: false, struckAt: 0, readings: [] }, // diagnostic en cours
   // Assistant multi-cordes : step = numéro de la corde en cours (1 = corde de référence).
-  unison: { strings: 3, step: 1, refFreq: null, refN: 1, result: null, okCount: 0, lastRun: 0, lastGood: null, lastGoodAt: 0, alone: false },
+  unison: { strings: 3, step: 1, refFreq: null, refN: 1, result: null, okCount: 0, lastRun: 0, lastGood: null, lastGoodAt: 0, alone: true },
 };
 
 let audioCtx = null;
@@ -304,10 +306,11 @@ function analyze(dt) {
   // hystérésis : une note suivie l'est jusqu'au bout de sa résonance, bien sous le seuil de départ
   if (level < (state.signal ? GATE_RELEASE : GATE)) return noSignal();
   if (since < ATTACK) return; // attaque en cours : on garde l'affichage et on attend le son stable
-  // une note qui s'éteint devient moins nette pour la détection : on garde celle qu'on suivait
-  const key = state.mode === 'target' ? state.key : autoKey(sr) ?? (state.signal ? state.key : null);
+  // une note qui s'éteint devient moins nette pour la détection (sous-harmonique pris pour une note grave) :
+  // on garde celle qu'on suivait, la note ne change qu'à une nouvelle frappe
+  const locked = state.mode === 'target' || (state.signal && since > STRIKE_LOCK);
+  const key = locked ? state.key : autoKey(sr) ?? (state.signal ? state.key : null);
   if (!key) return noSignal();
-  if (key !== state.key) selectKey(key, false);
 
   const ft = targetFor(key);
   // zone de recherche : ±70 ¢ autour de la cible, élargie jusqu'à la hauteur mesurée au diagnostic
@@ -329,20 +332,31 @@ function analyze(dt) {
   const m = measurePeak(buf, sr, n * center * ratio, { rangeCents: range, minSize: Math.max(2048, win) });
   // en fin de résonance (sous le seuil de départ), le partiel doit encore nettement dominer le bruit
   if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return noSignal();
-
   const f1 = m.freq / (n * ratio);
+  // début de note : deux relevés successifs doivent concorder. Un choc bref (clic, mécanique) a un spectre
+  // plat et donnait un pic arbitraire, toujours le même (« La4 +51.6 ¢, 453.32 Hz »), gardé comme dernière mesure.
+  if (!state.signal || state.fresh || key !== state.key) {
+    const confirmed = state.pendingHz != null && Math.abs(cents(f1, state.pendingHz)) <= 20;
+    state.pendingHz = f1;
+    if (!confirmed) return;
+  }
+  state.pendingHz = null;
+  // on ne change de note qu'une fois la nouvelle mesurée : un bruit bref (touche relâchée) n'efface pas l'affichage
+  if (key !== state.key) selectKey(key, false);
+
   state.history.push(cents(f1, ft));
   if (state.history.length > 5) state.history.shift();
   const median = [...state.history].sort((a, b) => a - b)[state.history.length >> 1];
   const restart = state.cents == null || !state.signal || state.fresh;
   state.cents = restart ? median : state.cents + 0.4 * (median - state.cents);
   state.fresh = false;
-  state.measuredFreq = f1;
+  state.measuredFreq = ft * 2 ** (state.cents / 1200); // cohérent avec les cents lissés affichés
   state.partial = n;
   state.signal = true;
   logReading(key, cents(f1, ft), f1, m.strength, n);
   state.partialFreqs.push(m.freq);
   if (state.partialFreqs.length > 15) state.partialFreqs.shift();
+  state.lastPartialFreqs = [...state.partialFreqs]; // gardé après la fin de la note, pour valider à la main
 
   if (++state.frame % 3 === 0 && level >= GATE && m.strength >= 0.2) analyzePartials(key, f1, sr, win);
   const done = state.mode === 'target' && state.unison.strings > 1 && state.unison.step > state.unison.strings;
@@ -361,7 +375,10 @@ function noteCompleted(delay) {
 // comme la voisine du dessous, et c'est elle qu'on aurait prise pour une fausse note.
 function wrongNoteHeard(sr, key, lo, hi = lo, tolerance = 150) {
   const r = detectPitch(buf, sr, { size: 8192 });
-  if (!r || r.clarity < 0.85) return false;
+  if (!r || r.clarity < 0.85) {
+    state.wrongSince = 0;
+    return false;
+  }
   const fold = (c) => {
     c %= 1200; // une erreur d'octave de la détection n'est pas une fausse note
     return c > 600 ? c - 1200 : c < -600 ? c + 1200 : c;
@@ -371,11 +388,24 @@ function wrongNoteHeard(sr, key, lo, hi = lo, tolerance = 150) {
   const dist = c < Math.min(0, span) ? Math.min(0, span) - c : c > Math.max(0, span) ? c - Math.max(0, span) : 0;
   if (dist <= tolerance) {
     state.wrongNote = null;
+    state.wrongSince = 0;
     return false;
   }
+  // sous-multiple pris par la détection (La4 à 415 Hz lu 83 Hz, « Fa4 » une fois replié) : une vraie
+  // fausse touche a son fondamental bien présent, un artefact n'a rien à cette fréquence
+  const heard = measurePeak(buf, sr, r.freq, { rangeCents: 40, minSize: 4096 });
+  if (heard.edge || heard.strength < 0.1) {
+    state.wrongSince = 0;
+    return false;
+  }
+  // une autre note doit s'entendre un moment avant d'être signalée : un bruit bref (touche relâchée,
+  // étouffoir) ne compte pas. En attendant, on ne mesure pas non plus (rien d'enregistré au diagnostic).
+  const now = performance.now();
+  state.wrongSince ||= now;
+  if (now - state.wrongSince < WRONG_HOLD) return true;
   // touche entendue, comptée sur ce piano : à combien de demi-tons de la hauteur attendue
   state.wrongNote = Math.min(KEY_COUNT, Math.max(1, key + Math.round(c / 100)));
-  state.wrongAt = performance.now();
+  state.wrongAt = now;
   return true;
 }
 
@@ -397,6 +427,7 @@ function localOffset(key) {
 function noSignal() {
   flushLog();
   state.signal = false;
+  state.pendingHz = null;
   state.inTuneTime = 0;
   state.history = [];
   state.partialFreqs = [];
@@ -409,6 +440,12 @@ function analyzeUnisonStep(dt, level) {
   if (now - u.lastRun < UNISON_INTERVAL) return;
   u.lastRun = now;
   const sr = audioCtx.sampleRate;
+  if (!struckSinceStep(sinceStrike(sr))) {
+    u.result = null;
+    state.signal = false;
+    state.cents = null;
+    return;
+  }
   const samples = recent(Math.min(RING_SIZE, Math.round(sr * UNISON_SECONDS)));
   let r = level < GATE ? null : analyzeUnison(samples, sr, u.refFreq, { fundamental: u.refFreq / u.refN });
   const confident = r && r.status !== 'unsure';
@@ -431,29 +468,73 @@ function analyzeUnisonStep(dt, level) {
   state.measuredFreq = r && state.signal ? (u.refFreq + (r.status === 'slow' ? 0 : r.beat)) / u.refN : null;
   if (r?.status === 'slow' || (state.signal && Math.abs(r.cents) <= tol())) {
     if (++u.okCount >= 4) finishString();
-  } else {
-    u.okCount = 0;
+  } else if (!state.signal || Math.abs(r.cents) > 2 * tol()) {
+    u.okCount = 0; // une lecture tout juste hors tolérance (±2 ¢ qui oscillent) ne fait que suspendre le compte
   }
 }
 
 // Corde mesurée seule (la corde 1 étouffée) : comparaison directe avec la fréquence mémorisée de la corde 1.
+// La note qui sonnait au changement de corde ne compte pas : la corde suivante est encore étouffée, on
+// aurait mesuré la corde de référence (« juste » sans y avoir touché). Il faut une frappe après ce changement.
+function struckSinceStep(since) {
+  const u = state.unison;
+  if (since < STRIKE_LOOKBACK && performance.now() - since * 1000 > (u.stepAt ?? 0)) u.struck = u.step;
+  return u.struck === u.step;
+}
+
 function analyzeAlone(dt, level) {
   const u = state.unison;
-  if (level < GATE) return noSignal();
-  const m = measurePeak(buf, audioCtx.sampleRate, u.refFreq, { rangeCents: 70 });
-  if (m.strength < 0.05) return noSignal();
+  const sr = audioCtx.sampleRate;
+  const since = sinceStrike(sr);
+  if (!struckSinceStep(since)) return noSignal();
+  if (since < state.sinceStrike - 0.01) {
+    state.history = [];
+    state.fresh = true;
+  }
+  state.sinceStrike = since;
+  // comme pour une note : suivie jusqu'au bout de sa résonance, attaque ignorée, fenêtre qui s'allonge
+  if (level < (state.signal ? GATE_RELEASE : GATE)) return noSignal();
+  if (since < ATTACK) return;
+  const win = Math.round(sr * Math.min(MAX_WINDOW, since - ATTACK));
+  const m = measurePeak(buf, sr, u.refFreq, { rangeCents: 70, minSize: Math.max(2048, win) });
+  if (m.edge || m.strength < (level < GATE ? 0.1 : 0.05)) return noSignal();
+  // début de note : deux relevés successifs doivent concorder (un relevé isolé de l'attaque affichait +55 ¢)
+  if (!state.signal || state.fresh) {
+    const confirmed = state.pendingHz != null && Math.abs(cents(m.freq, state.pendingHz)) <= 20;
+    state.pendingHz = m.freq;
+    if (!confirmed) return;
+  }
+  state.pendingHz = null;
   state.history.push(cents(m.freq, u.refFreq));
   if (state.history.length > 5) state.history.shift();
   const median = [...state.history].sort((a, b) => a - b)[state.history.length >> 1];
-  state.cents = state.cents == null || !state.signal ? median : state.cents + 0.4 * (median - state.cents);
-  state.measuredFreq = m.freq / u.refN;
+  const restart = state.cents == null || !state.signal || state.fresh;
+  state.cents = restart ? median : state.cents + 0.4 * (median - state.cents);
+  state.fresh = false;
+  state.measuredFreq = (u.refFreq * 2 ** (state.cents / 1200)) / u.refN;
   state.signal = true;
   if (Math.abs(state.cents) <= tol()) {
     state.inTuneTime += dt;
     if (state.inTuneTime >= IN_TUNE_HOLD) finishString();
-  } else {
+  } else if (Math.abs(state.cents) > 2 * tol()) {
     state.inTuneTime = 0;
   }
+}
+
+// Validation à la main. Corde 1 : on fige la hauteur de sa dernière mesure comme référence des suivantes.
+function validateString() {
+  const u = state.unison;
+  if (u.step !== 1) return finishString();
+  if (!state.lastPartialFreqs?.length) return;
+  if (u.strings > 1) {
+    state.partialFreqs = [...state.lastPartialFreqs];
+    captureReference();
+    return;
+  }
+  const p = (progress[state.key] ||= {});
+  p.tuned = true;
+  save();
+  noteCompleted(700);
 }
 
 function finishString() {
@@ -461,11 +542,11 @@ function finishString() {
   u.okCount = 0;
   u.result = null;
   u.lastGood = null;
-  u.alone = false;
   state.inTuneTime = 0;
   state.history = [];
   if (u.step < u.strings) {
     u.step++;
+    u.stepAt = performance.now();
     return;
   }
   const p = (progress[state.key] ||= {});
@@ -484,6 +565,7 @@ function captureReference() {
   u.refFreq = f;
   u.refN = state.partial;
   u.step = 2;
+  u.stepAt = performance.now();
   u.okCount = 0;
   u.result = null;
   state.signal = false;
@@ -497,7 +579,6 @@ function resetUnison() {
   u.refFreq = null;
   u.result = null;
   u.lastGood = null;
-  u.alone = false;
   u.okCount = 0;
 }
 
@@ -538,7 +619,10 @@ function analyzePartials(key, f1, sr, win = 0) {
   const fit = fitInharmonicity(found);
   if (fit && found.length >= 4 && fit.B >= 0 && fit.B < 0.05 && fitError(found, fit) < 2) {
     const p = (progress[key] ||= {});
-    p.B = p.B == null ? fit.B : p.B + 0.2 * (fit.B - p.B);
+    // moyenne qui se fige peu à peu : une estimation bruitée ne doit plus déplacer l'aiguille (mesurée sur un
+    // partiel élevé dans le grave, un écart de B de 4e-4 décalait la lecture de ~5 ¢ sans que la corde bouge)
+    p.Bn = (p.Bn ?? (p.B == null ? 0 : 5)) + 1;
+    p.B = p.B == null ? fit.B : p.B + Math.max(0.02, 1 / p.Bn) * (fit.B - p.B);
   }
   const base = fit?.f0 ?? f1;
   state.partials = found.map((p) => ({ ...p, dev: cents(p.freq, p.n * base) }));
@@ -547,9 +631,12 @@ function analyzePartials(key, f1, sr, win = 0) {
 
 function trackProgress(key, dt) {
   const p = (progress[key] ||= {});
-  p.cents = state.cents;
-  p.hz = state.measuredFreq; // dernière mesure, réaffichée quand la note ne sonne plus
-  p.at = Date.now();
+  // dernière mesure, réaffichée quand la note ne sonne plus ; un son de quelques millisecondes ne la remplace pas
+  if (logCur?.key === key && logCur.c.length >= 3) {
+    p.cents = state.cents;
+    p.hz = state.measuredFreq;
+    p.at = Date.now();
+  }
   if (Math.abs(state.cents) <= tol()) {
     state.inTuneTime += dt;
     const multi = state.mode === 'target' && state.unison.strings > 1 && state.unison.step === 1;
@@ -563,7 +650,8 @@ function trackProgress(key, dt) {
       if (state.mode === 'target') noteCompleted(700);
     }
   } else {
-    state.inTuneTime = 0;
+    // une lecture tout juste hors tolérance (la note qui ondule autour de ±2 ¢) suspend le compte sans l'effacer
+    if (Math.abs(state.cents) > 2 * tol()) state.inTuneTime = 0;
     if (Math.abs(state.cents) > tol() * 3 && p.tuned) p.tuned = false;
   }
 }
@@ -926,6 +1014,14 @@ function flushLog() {
   if (!cur || cur.c.length < 3) return;
   const sorted = (a) => [...a].sort((x, y) => x - y);
   const med = (a) => sorted(a)[a.length >> 1];
+  // dernière mesure affichée : la valeur centrale de la dernière seconde de son fiable — ni la toute fin de note
+  // (son faible), ni toute la frappe (la cheville a pu bouger pendant ce temps)
+  const p = progress[cur.key];
+  if (cur.mode !== 'diagnostic' && p?.hz) {
+    const end = Math.max(3, cur.hz.length - 3);
+    p.hz = med(cur.hz.slice(Math.max(0, end - 15), end));
+    p.at = Date.now();
+  }
   pushLog({
     mode: cur.mode === 'target' ? (planStep() ? 'accord guidé' : 'note') : cur.mode,
     key: cur.key,
@@ -1453,7 +1549,7 @@ function guideHint() {
   if (inUnisonStep() && u.alone) {
     const which = name(u.step);
     if (!state.signal || state.cents == null) {
-      return { cls: '', text: 'Joue la note', sub: `Seule ${which} doit sonner : étouffe la corde 1${u.step === 3 ? ' et la corde 2' : ''}.` };
+      return { cls: '', text: 'Joue la note', sub: `Seule ${which} doit sonner : étouffe ${u.step === 3 ? 'les cordes 1 et 2' : u.strings === 3 ? 'les cordes 1 et 3' : 'la corde 1'}.` };
     }
     const c = state.cents;
     if (Math.abs(c) <= tol()) return { cls: 'good', text: '✓ Juste', sub: `${which} est accordée sur la corde 1…` };
@@ -1511,9 +1607,10 @@ function stepTexts(strings, alone, step) {
     `<b>Corde 2</b> : libère la corde 2${strings === 3 ? ' (la 3 reste étouffée)' : ''} et joue la note. L'appli compare les deux cordes et te dit dans quel sens tourner.`,
   ];
   if (strings === 3) steps.push('<b>Corde 3</b> : retire le dernier coin et joue la note. Règle la corde 3 de la même façon.');
-  if (alone && step > 1) {
-    const muted = step === 3 ? 'les cordes 1 et 2' : 'la corde 1';
-    steps[step - 1] = `<b>Corde ${step} seule</b> : étouffe ${muted} pour que seule la corde ${step} sonne, joue la note et suis l'aiguille : elle compare la corde ${step} à la note mémorisée de la corde 1.`;
+  if (alone) {
+    // mesure directe : une seule corde sonne à chaque étape, l'aiguille suit la cheville en temps réel
+    steps[1] = `<b>Corde 2</b> : déplace les coins pour que seule la corde 2 sonne${strings === 3 ? ' (1 et 3 étouffées)' : ' (1 étouffée)'}, joue la note et suis l'aiguille : elle compare la corde 2 à la note mémorisée de la corde 1.`;
+    if (strings === 3) steps[2] = "<b>Corde 3</b> : seule la corde 3 sonne (1 et 2 étouffées). Règle-la de la même façon, puis retire les coins et écoute : plus d'ondulation, l'unisson est fait.";
   }
   return steps;
 }
@@ -1542,9 +1639,13 @@ function renderAssistant() {
         return `<li class="${cls}">${t}</li>`;
       })
       .join('');
-    const tools = inUnisonStep()
+    // corde 1 (ou note à une corde) : validable à la main dès qu'elle a été mesurée, quand on la juge assez juste
+    const first = u.step === 1 && state.lastPartialFreqs?.length >= 3;
+    const tools = first
+      ? `<div class="unison-tools"><button data-validate>✓ Valider ${u.strings > 1 ? 'la corde 1' : 'la note'} telle quelle</button></div>`
+      : inUnisonStep()
       ? `<div class="unison-tools"><button data-validate>✓ Valider la corde ${u.step}</button>
-        <button data-alone class="${u.alone ? 'active' : ''}">${u.alone ? 'Revenir à la comparaison des deux cordes' : `Mesurer la corde ${u.step} seule`}</button></div>`
+        <button data-alone class="${u.alone ? 'active' : ''}">${u.alone ? 'Comparer aux ondulations (les deux cordes sonnent)' : `Mesurer la corde ${u.step} seule (aiguille en direct)`}</button></div>`
       : '';
     html = `<div class="assistant-head"><span>Cordes pour cette note</span><span class="seg">${buttons}</span>
       <button data-restart>Recommencer la note</button></div><ol class="steps">${steps}</ol>${tools}`;
@@ -1647,6 +1748,7 @@ function selectKey(key, lock) {
     state.inTuneTime = 0;
     state.partials = [];
     state.partialFreqs = [];
+    state.lastPartialFreqs = [];
     state.advanceAt = 0;
     state.wrongNote = null;
     resetUnison();
@@ -1718,7 +1820,7 @@ function bindControls() {
       resetUnison();
       save();
     } else if (e.target.closest('[data-validate]')) {
-      finishString();
+      validateString();
     } else if (e.target.closest('[data-alone]')) {
       state.unison.alone = !state.unison.alone;
       state.unison.result = null;
